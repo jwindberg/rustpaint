@@ -4,6 +4,7 @@
 //! is the DLOG's rect, inside a double frame. The boxes are 1-bit; button
 //! labels are smooth text, like the menus'.
 
+mod about;
 mod brush_shape;
 mod edit_pattern;
 mod mirrors;
@@ -14,6 +15,7 @@ use rustpaint_engine::{BLACK_PATTERN, Canvas, Pattern, Point, Rect, Shape};
 pub use mirrors::{MIRROR_ANTI_DIAGONAL, MIRROR_DIAGONAL, MIRROR_HORIZONTAL, MIRROR_VERTICAL};
 
 use crate::art::{frame_qd_rect, paint_qd_rect};
+use crate::i18n::tr;
 use crate::text::TextFont;
 
 /// The double frame around a dialog's content: black, white, then a
@@ -43,16 +45,17 @@ pub enum Outcome {
 /// A push button, in content coordinates.
 struct Button {
     rect: Rect,
-    label: &'static str,
+    label: String,
     /// Return chooses it; it has the thick outline.
     default: bool,
 }
 
 impl Button {
-    fn new(left: i32, top: i32, right: i32, label: &'static str, default: bool) -> Self {
+    /// A button labelled with the message `label` (see crate::i18n).
+    fn new(left: i32, top: i32, right: i32, label: &str, default: bool) -> Self {
         Self {
             rect: Rect::new(left, top, right, top + BUTTON_HEIGHT),
-            label,
+            label: tr(label),
             default,
         }
     }
@@ -64,6 +67,7 @@ impl Button {
 }
 
 enum Kind {
+    About,
     EditPattern(edit_pattern::EditPattern),
     BrushShape(brush_shape::BrushShape),
     Mirrors(mirrors::Mirrors),
@@ -78,6 +82,10 @@ pub struct Dialog {
 }
 
 impl Dialog {
+    pub fn about() -> Self {
+        Self::new(Kind::About)
+    }
+
     pub fn edit_pattern(pattern: Pattern) -> Self {
         Self::new(Kind::EditPattern(edit_pattern::EditPattern::new(pattern)))
     }
@@ -97,6 +105,7 @@ impl Dialog {
 
     fn new(kind: Kind) -> Self {
         let buttons = match &kind {
+            Kind::About => about::buttons(),
             Kind::EditPattern(_) => edit_pattern::buttons(),
             Kind::BrushShape(_) => Vec::new(),
             Kind::Mirrors(_) => mirrors::buttons(),
@@ -111,6 +120,7 @@ impl Dialog {
 
     fn content_size(&self) -> (i32, i32) {
         match &self.kind {
+            Kind::About => about::SIZE,
             Kind::EditPattern(_) => edit_pattern::SIZE,
             Kind::BrushShape(_) => brush_shape::SIZE,
             Kind::Mirrors(_) => mirrors::SIZE,
@@ -149,6 +159,7 @@ impl Dialog {
         let (content_width, content_height) = self.content_size();
         let mut content = Canvas::new(content_width, content_height);
         match &self.kind {
+            Kind::About => about::render(&mut content),
             Kind::EditPattern(dialog) => dialog.render(&mut content),
             Kind::BrushShape(dialog) => dialog.render(&mut content),
             Kind::Mirrors(dialog) => dialog.render(&mut content),
@@ -185,9 +196,15 @@ impl Dialog {
         scale: u32,
         origin: Point,
     ) {
+        if let Kind::About = self.kind {
+            for (x, baseline, line) in about::lines() {
+                let (x, baseline) = (origin.x + FRAME + x, origin.y + FRAME + baseline);
+                font.draw(buffer, width, height, scale, x, baseline, &line, 0x000000);
+            }
+        }
         for (index, button) in self.buttons.iter().enumerate() {
             let rect = button.rect;
-            let x = origin.x + FRAME + (rect.left + rect.right - font.width(button.label)) / 2;
+            let x = origin.x + FRAME + (rect.left + rect.right - font.width(&button.label)) / 2;
             let baseline = origin.y + FRAME + rect.top + 13;
             let color = if self.pressed == Some((index, true)) {
                 0xffffff
@@ -201,7 +218,7 @@ impl Dialog {
                 scale,
                 x,
                 baseline,
-                button.label,
+                &button.label,
                 color,
             );
         }
@@ -214,6 +231,7 @@ impl Dialog {
 
     fn button_outcome(&self, index: usize) -> Outcome {
         match &self.kind {
+            Kind::About => about::button(index),
             Kind::EditPattern(dialog) => dialog.button(index),
             Kind::BrushShape(_) => Outcome::Open,
             Kind::Mirrors(dialog) => dialog.button(index),
@@ -230,6 +248,7 @@ impl Dialog {
             return Outcome::Open;
         }
         match &mut self.kind {
+            Kind::About => {}
             Kind::EditPattern(dialog) => dialog.mouse_down(point),
             Kind::BrushShape(dialog) => return dialog.mouse_down(point),
             Kind::Mirrors(dialog) => dialog.mouse_down(point),

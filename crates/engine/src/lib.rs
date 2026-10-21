@@ -9,6 +9,7 @@ pub mod mac_icons;
 pub mod macpaint_file;
 pub mod paint_font;
 pub mod patterns;
+pub mod pdf;
 pub mod selection;
 pub mod symmetry;
 

@@ -82,7 +82,7 @@ impl MenuBar {
         let titles = menus
             .iter()
             .map(|menu| {
-                let width = font.width(menu.title) + 2 * TITLE_PADDING;
+                let width = font.width(&menu.title) + 2 * TITLE_PADDING;
                 let rect = Rect::new(left, 0, left + width, HEIGHT - 1);
                 left += width;
                 rect
@@ -333,7 +333,7 @@ impl MenuBar {
             draw(
                 title.left + TITLE_PADDING,
                 14,
-                self.menus[index].title,
+                &self.menus[index].title,
                 color,
             );
         }
@@ -410,10 +410,10 @@ mod tests {
         let mut bar = bar();
         let file = Point::new(bar.titles[0].left + 5, 10);
         assert!(bar.mouse_down(file, ALL) && bar.is_open());
-        // File: New, Open, separator, Save, ...
-        let save = row_point(&bar, 3);
+        // File: About, separator, New, Open, separator, Save, ...
+        let save = row_point(&bar, 5);
         bar.mouse_moved(save, ALL);
-        assert_eq!(bar.highlight, Some(3));
+        assert_eq!(bar.highlight, Some(5));
         assert_eq!(bar.mouse_up(save, ALL), Some(Command::Save));
         assert!(!bar.is_open());
     }
@@ -482,6 +482,6 @@ mod tests {
         assert!(open.get(bar.titles[0].left + 1, 2));
         let (origin, menu) = bar.render_menu(ALL).unwrap();
         assert_eq!(origin, Point::new(bar.titles[0].left, HEIGHT - 1));
-        assert!(menu.width() > 120 && menu.height() == 9 * ROW_HEIGHT + 3);
+        assert!(menu.width() > 120 && menu.height() == 14 * ROW_HEIGHT + 3);
     }
 }

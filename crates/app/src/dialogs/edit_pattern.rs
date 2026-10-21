@@ -10,8 +10,8 @@ pub const SIZE: (i32, i32) = (176, 128);
 
 pub fn buttons() -> Vec<Button> {
     vec![
-        Button::new(16, 92, 80, "OK", true),
-        Button::new(96, 92, 160, "Cancel", false),
+        Button::new(16, 92, 80, "ok", true),
+        Button::new(96, 92, 160, "cancel", false),
     ]
 }
 

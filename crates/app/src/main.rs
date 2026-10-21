@@ -2,11 +2,16 @@
 //! everything into one 1-bit-looking software framebuffer, as MacPaint did,
 //! scaled up by a whole number on HiDPI screens to keep the pixels crisp.
 
+// No console window on Windows, except in debug builds.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod art;
+mod catalog;
 mod clipboard;
 mod commands;
 mod dialogs;
 mod documents;
+mod i18n;
 mod images;
 mod menu_bar;
 #[cfg(target_os = "macos")]
@@ -30,6 +35,7 @@ use rustpaint_engine::paint_font::{
     GLYPH_PENCIL_MASK, GLYPH_SPRAY,
 };
 use rustpaint_engine::patterns::{DEFAULT_PATTERN_INDEX, PATTERN_COUNT, PATTERNS};
+use rustpaint_engine::pdf::write_pdf;
 use rustpaint_engine::symmetry::map_symmetry;
 use rustpaint_engine::{Canvas, Pattern, Point, Rect};
 use softbuffer::{Context, Surface};
@@ -41,12 +47,14 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::art::CURSOR_SIZE;
+use crate::catalog::catalog_pages;
 use crate::clipboard::Clipboard;
 use crate::commands::{Command, Face, MenuState, TextMenuState};
 use crate::dialogs::{
     Dialog, MIRROR_ANTI_DIAGONAL, MIRROR_DIAGONAL, MIRROR_HORIZONTAL, MIRROR_VERTICAL, Outcome,
 };
 use crate::documents::{MACPAINT_EXTENSIONS, export_png, load_document, save_macpaint};
+use crate::i18n::{tr, tr_args};
 use crate::page_view::{Modifiers, PageView, SelectionCommand, TextKey, ant_bit};
 use crate::palettes::{line_widths, patterns, tools};
 use crate::text::TextFont;
@@ -74,7 +82,6 @@ const LINE_SCROLL: f64 = 16.0;
 /// kinder.
 const ANTS_INTERVAL: Duration = Duration::from_millis(40);
 
-const UNTITLED: &str = "untitled";
 /// FatBits: MacPaint's 8x magnification.
 const FAT_ZOOM: i32 = 8;
 
@@ -253,7 +260,7 @@ impl App {
             #[cfg(target_os = "macos")]
             menus: None,
             path: None,
-            name: UNTITLED.into(),
+            name: tr("untitled"),
             quit_requested: false,
         }
     }
@@ -587,6 +594,13 @@ impl App {
             _ => None,
         };
         match command {
+            Command::About => self.show_dialog(Dialog::about()),
+            Command::Print => {
+                let pages = vec![self.view.canvas().clone()];
+                let name = format!("{}.pdf", stem(&self.name));
+                self.print(&pages, &name);
+            }
+            Command::PrintCatalog => self.print_catalog(),
             Command::New => {
                 if self.confirm_discard() {
                     self.new_document();
@@ -734,7 +748,7 @@ impl App {
     }
 
     fn show_error(&self, text: &str) {
-        self.message_dialog("Error", text)
+        self.message_dialog(&tr("error"), text)
             .set_level(rfd::MessageLevel::Error)
             .show();
     }
@@ -745,25 +759,21 @@ impl App {
         if !self.view.is_dirty() {
             return true;
         }
-        let text = format!("Save changes to the document \"{}\"?", self.name);
+        let text = tr_args("save-changes", &[("name", &self.name)]);
         let dialog = self
-            .message_dialog("Unsaved changes", &text)
+            .message_dialog(&tr("unsaved-changes"), &text)
             .set_level(rfd::MessageLevel::Warning);
         // Windows needs a manifest for custom labels; Yes and No stand in.
         let buttons = if cfg!(target_os = "windows") {
             rfd::MessageButtons::YesNoCancel
         } else {
-            rfd::MessageButtons::YesNoCancelCustom(
-                "Save".into(),
-                "Don't Save".into(),
-                "Cancel".into(),
-            )
+            rfd::MessageButtons::YesNoCancelCustom(tr("save"), tr("dont-save"), tr("cancel"))
         };
         match dialog.set_buttons(buttons).show() {
             rfd::MessageDialogResult::Yes => self.save(),
             rfd::MessageDialogResult::No => true,
-            rfd::MessageDialogResult::Custom(label) if label == "Save" => self.save(),
-            rfd::MessageDialogResult::Custom(label) if label == "Don't Save" => true,
+            rfd::MessageDialogResult::Custom(label) if label == tr("save") => self.save(),
+            rfd::MessageDialogResult::Custom(label) if label == tr("dont-save") => true,
             _ => false,
         }
     }
@@ -772,7 +782,7 @@ impl App {
         self.view.set_image(Canvas::default());
         self.set_patterns(PATTERNS);
         self.path = None;
-        self.set_name(UNTITLED.into());
+        self.set_name(tr("untitled"));
     }
 
     fn open(&mut self) {
@@ -781,14 +791,14 @@ impl App {
         }
         let path = self
             .file_dialog()
-            .add_filter("MacPaint documents", &MACPAINT_EXTENSIONS)
+            .add_filter(tr("filter-macpaint-documents"), &MACPAINT_EXTENSIONS)
             .add_filter(
-                "Images",
+                tr("filter-images"),
                 &[
                     "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "pbm", "pgm", "ppm",
                 ],
             )
-            .add_filter("All files", &["*"])
+            .add_filter(tr("filter-all"), &["*"])
             .pick_file();
         if let Some(path) = path {
             self.open_path(&path);
@@ -836,7 +846,7 @@ impl App {
         let Some(path) = self
             .file_dialog()
             .set_file_name(name)
-            .add_filter("MacPaint document", &MACPAINT_EXTENSIONS)
+            .add_filter(tr("filter-macpaint-document"), &MACPAINT_EXTENSIONS)
             .save_file()
         else {
             return false;
@@ -857,7 +867,7 @@ impl App {
         };
         // MacPaint's Revert alert.
         let answer = self
-            .message_dialog("Revert", "Revert to the last version saved?")
+            .message_dialog(&tr("revert"), &tr("revert-question"))
             .set_level(rfd::MessageLevel::Warning)
             .set_buttons(rfd::MessageButtons::OkCancel)
             .show();
@@ -866,11 +876,43 @@ impl App {
         }
     }
 
+    /// Prints by writing a PDF and opening it in the system's viewer, which
+    /// prints it: there's no good cross-platform printing to use instead.
+    fn print(&self, pages: &[Canvas], file_name: &str) {
+        let path = std::env::temp_dir().join(file_name);
+        let result = std::fs::write(&path, write_pdf(pages))
+            .map_err(|error| tr_args("error-print", &[("error", &error.to_string())]))
+            .and_then(|()| open_in_viewer(&path));
+        if let Err(error) = result {
+            self.show_error(&error);
+        }
+    }
+
+    /// MacPaint's Print Catalog, of a folder chosen here, starting in the
+    /// document's own, as MacPaint catalogs its disk.
+    fn print_catalog(&mut self) {
+        let mut dialog = self.file_dialog().set_title(tr("print-catalog-title"));
+        if let Some(folder) = self.path.as_ref().and_then(|path| path.parent()) {
+            dialog = dialog.set_directory(folder);
+        }
+        let Some(folder) = dialog.pick_folder() else {
+            return;
+        };
+        let name = file_name(&folder);
+        let heading = tr_args("catalog-heading", &[("folder", &name)]);
+        let pages = catalog_pages(&folder, &heading, &self.typesetter);
+        if pages.is_empty() {
+            self.show_error(&tr("no-documents"));
+            return;
+        }
+        self.print(&pages, &format!("{name} catalog.pdf"));
+    }
+
     fn export(&mut self) {
         let path = self
             .file_dialog()
             .set_file_name(format!("{}.png", stem(&self.name)))
-            .add_filter("PNG image", &["png"])
+            .add_filter(tr("filter-png"), &["png"])
             .save_file();
         if let Some(path) = path
             && let Err(error) = export_png(&path, self.view.canvas())
@@ -1230,14 +1272,15 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let page_height = Canvas::DEFAULT_HEIGHT;
         let attributes = Window::default_attributes()
-            .with_title("untitled")
+            .with_title(tr("untitled"))
             .with_inner_size(LogicalSize::new(
                 Layout::minimum_size()
                     .width
                     .max(Layout::new(0, 0).page.left + Canvas::DEFAULT_WIDTH + MARGIN),
                 (MARGIN + page_height * 7 / 8 + MARGIN + patterns::HEIGHT + 1 + MARGIN).min(900),
             ))
-            .with_min_inner_size(Layout::minimum_size());
+            .with_min_inner_size(Layout::minimum_size())
+            .with_window_icon(window_icon());
         let window = Rc::new(
             event_loop
                 .create_window(attributes)
@@ -1450,7 +1493,7 @@ fn main() {
 fn file_name(path: &Path) -> String {
     path.file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| UNTITLED.into())
+        .unwrap_or_else(|| tr("untitled"))
 }
 
 /// A name without its extension.
@@ -1484,4 +1527,47 @@ fn blit(
             }
         }
     }
+}
+
+/// Opens a file in the system's viewer for its kind.
+fn open_in_viewer(path: &Path) -> Result<(), String> {
+    let mut command = if cfg!(target_os = "macos") {
+        std::process::Command::new("open")
+    } else if cfg!(target_os = "windows") {
+        let mut command = std::process::Command::new("cmd");
+        command.args(["/C", "start", ""]);
+        command
+    } else {
+        std::process::Command::new("xdg-open")
+    };
+    command
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| tr_args("error-print-open", &[("error", &error.to_string())]))
+}
+
+/// MacPaint's application icon (ICN# 128), for the window's title bar and
+/// task bar on Windows and Linux, scaled up in whole pixels.
+fn window_icon() -> Option<winit::window::Icon> {
+    use rustpaint_engine::mac_icons::{APP_ICON, APP_ICON_MASK, MAC_ICON_SIZE};
+    const SCALE: usize = 2;
+    let side = MAC_ICON_SIZE * SCALE;
+    let bit = |data: &[u8], x: usize, y: usize| {
+        (data[y * MAC_ICON_SIZE / 8 + x / 8] >> (7 - x % 8)) & 1 != 0
+    };
+    let mut rgba = Vec::with_capacity(side * side * 4);
+    for y in 0..side {
+        for x in 0..side {
+            let (ix, iy) = (x / SCALE, y / SCALE);
+            rgba.extend(if !bit(&APP_ICON_MASK, ix, iy) {
+                [0, 0, 0, 0]
+            } else if bit(&APP_ICON, ix, iy) {
+                [0, 0, 0, 255]
+            } else {
+                [255, 255, 255, 255]
+            });
+        }
+    }
+    winit::window::Icon::from_rgba(rgba, side as u32, side as u32).ok()
 }

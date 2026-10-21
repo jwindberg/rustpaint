@@ -1,0 +1,102 @@
+# Builds the packages for a version tag (v1.2.3) and attaches them to a
+# draft release, to be published by hand.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - name: Build (Apple silicon and Intel)
+        run: |
+          cargo build --release -p rustpaint --target aarch64-apple-darwin
+          cargo build --release -p rustpaint --target x86_64-apple-darwin
+      - name: Make RustPaint.app
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          app=RustPaint.app/Contents
+          mkdir -p "$app/MacOS" "$app/Resources"
+          lipo -create -output "$app/MacOS/rustpaint" \
+            target/aarch64-apple-darwin/release/rustpaint \
+            target/x86_64-apple-darwin/release/rustpaint
+          sed "s/VERSION/$version/g" packaging/macos/Info.plist > "$app/Info.plist"
+          cargo run --release -p rustpaint --example make_icons -- icons
+          iconset=RustPaint.iconset
+          mkdir "$iconset"
+          for size in 16 32 128 256 512; do
+            cp "icons/icon_$size.png" "$iconset/icon_${size}x${size}.png"
+            cp "icons/icon_$((size * 2)).png" "$iconset/icon_${size}x${size}@2x.png"
+          done
+          iconutil -c icns "$iconset" -o "$app/Resources/RustPaint.icns"
+          ditto -c -k --keepParent RustPaint.app "RustPaint-$version-macOS.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: RustPaint-*-macOS.zip
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p rustpaint
+      - name: Make the AppImage
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          cargo run --release -p rustpaint --example make_icons -- icons
+          mkdir -p AppDir/usr/bin
+          cp target/release/rustpaint AppDir/usr/bin/
+          cp packaging/linux/rustpaint.desktop AppDir/
+          cp icons/icon_256.png AppDir/rustpaint.png
+          ln -s usr/bin/rustpaint AppDir/AppRun
+          curl -sSfL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 ./appimagetool AppDir "RustPaint-$version-x86_64.AppImage"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: RustPaint-*.AppImage
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release -p rustpaint
+      - name: Zip
+        shell: pwsh
+        run: |
+          $version = "$env:GITHUB_REF_NAME".TrimStart("v")
+          New-Item -ItemType Directory RustPaint | Out-Null
+          Copy-Item target/release/rustpaint.exe RustPaint/RustPaint.exe
+          Copy-Item LICENSE, ATTRIBUTION.md, assets/fonts/OFL-Inter.txt RustPaint/
+          Compress-Archive RustPaint "RustPaint-$version-windows-x64.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: RustPaint-*-windows-x64.zip
+
+  release:
+    needs: [macos, linux, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: RustPaint-*

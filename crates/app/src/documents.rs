@@ -5,10 +5,13 @@
 use std::path::Path;
 
 use image::ImageFormat;
-use rustpaint_engine::macpaint_file::{macpaint_data_offset, read_macpaint, write_macpaint};
+use rustpaint_engine::macpaint_file::{
+    MacPaintError, macpaint_data_offset, read_macpaint, write_macpaint,
+};
 use rustpaint_engine::patterns::{PATTERN_COUNT, PATTERNS};
 use rustpaint_engine::{Canvas, Pattern};
 
+use crate::i18n::{tr, tr_args};
 use crate::images::dither_rgba;
 
 /// The file name extensions MacPaint documents go by.
@@ -35,12 +38,26 @@ fn looks_like_macpaint(path: &Path, data: &[u8]) -> bool {
     MACPAINT_EXTENSIONS.contains(&extension.as_str()) || macpaint_data_offset(data) != 0
 }
 
+/// A quick check, without reading the whole file: whether its name or
+/// MacBinary header says it's a MacPaint document.
+pub fn is_macpaint_document(path: &Path) -> bool {
+    use std::io::Read;
+    // Enough for a MacBinary header and the MacPaint header after it.
+    let mut start = vec![0; 128 + 512];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut start))
+        .unwrap_or(0);
+    start.truncate(read);
+    looks_like_macpaint(path, &start)
+}
+
 /// Loads a document. MacPaint files are read as they are (with the
 /// standard patterns if they have none of their own); any other image is
 /// converted to black and white and placed at the top left, cropped to
 /// fit, with the standard patterns.
 pub fn load_document(path: &Path) -> Result<Document, String> {
-    let data = std::fs::read(path).map_err(|error| format!("Couldn't open the file: {error}"))?;
+    let data = std::fs::read(path)
+        .map_err(|error| tr_args("error-open", &[("error", &error.to_string())]))?;
 
     let macpaint = |data: &[u8]| {
         read_macpaint(data).map(|document| Document {
@@ -55,7 +72,7 @@ pub fn load_document(path: &Path) -> Result<Document, String> {
     if small && looks_like_macpaint(path, &data) {
         match macpaint(&data) {
             Ok(document) => return Ok(document),
-            Err(error) => reason = Some(error.to_string()),
+            Err(error) => reason = Some(macpaint_error(error)),
         }
     }
 
@@ -80,7 +97,7 @@ pub fn load_document(path: &Path) -> Result<Document, String> {
         return Ok(document);
     }
 
-    Err(reason.unwrap_or_else(|| "RustPaint can't read this kind of file.".into()))
+    Err(reason.unwrap_or_else(|| tr("error-unreadable")))
 }
 
 /// Writes the image and its patterns as a MacPaint document, creating or
@@ -91,7 +108,20 @@ pub fn save_macpaint(
     patterns: &[Pattern; PATTERN_COUNT],
 ) -> Result<(), String> {
     std::fs::write(path, write_macpaint(canvas, patterns))
-        .map_err(|error| format!("Couldn't save the document: {error}"))
+        .map_err(|error| tr_args("error-save", &[("error", &error.to_string())]))
+}
+
+fn export_error(reason: &str) -> String {
+    tr_args("error-export", &[("error", reason)])
+}
+
+/// The engine's reason a MacPaint document can't be read, translated.
+fn macpaint_error(error: MacPaintError) -> String {
+    tr(match error {
+        MacPaintError::TooShort => "error-too-short",
+        MacPaintError::NotMacPaint => "error-not-macpaint",
+        MacPaintError::Damaged => "error-damaged",
+    })
 }
 
 /// Writes the image as a black and white PNG.
@@ -102,10 +132,10 @@ pub fn export_png(path: &Path, canvas: &Canvas) -> Result<(), String> {
         .map(|&black| if black != 0 { 0 } else { 255 })
         .collect();
     let image = image::GrayImage::from_raw(canvas.width() as u32, canvas.height() as u32, gray)
-        .ok_or("Couldn't export the image.")?;
+        .ok_or_else(|| export_error("the page has no pixels"))?;
     image
         .save_with_format(path, ImageFormat::Png)
-        .map_err(|error| format!("Couldn't export the image: {error}"))
+        .map_err(|error| export_error(&error.to_string()))
 }
 
 #[cfg(test)]

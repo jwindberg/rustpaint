@@ -40,16 +40,14 @@ impl MenuBar {
         let mut items = Vec::new();
 
         {
-            // The application menu, with Quit, which RustPaint handles so
-            // it can ask about unsaved changes first.
+            // The application menu.
             let app_menu = Submenu::new("RustPaint", true);
-            let about = muda::AboutMetadata {
-                name: Some("RustPaint".into()),
-                ..Default::default()
-            };
+            // About and Quit are RustPaint's own: MacPaint's About box, and
+            // Quit asks about unsaved changes first.
+            let about = new_item(Command::About, families);
             let quit = new_item(Command::Quit, families);
             let _ = app_menu.append_items(&[
-                &PredefinedMenuItem::about(None, Some(about)),
+                about.as_menu_item(),
                 &PredefinedMenuItem::separator(),
                 &PredefinedMenuItem::services(None),
                 &PredefinedMenuItem::separator(),
@@ -60,18 +58,19 @@ impl MenuBar {
                 quit.as_menu_item(),
             ]);
             let _ = menu.append(&app_menu);
+            items.push((Command::About, about));
             items.push((Command::Quit, quit));
         }
 
         for spec in menus(families.len()) {
-            let submenu = Submenu::new(spec.title, true);
+            let submenu = Submenu::new(&spec.title, true);
             let mut first = true;
             for group in &spec.groups {
-                // Quit lives in the application menu on macOS.
+                // About and Quit live in the application menu on macOS.
                 let commands: Vec<Command> = group
                     .iter()
                     .copied()
-                    .filter(|&c| c != Command::Quit)
+                    .filter(|&c| c != Command::Quit && c != Command::About)
                     .collect();
                 if commands.is_empty() {
                     continue;

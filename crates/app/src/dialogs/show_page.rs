@@ -68,8 +68,8 @@ impl ShowPage {
         let top = self.small.height() + 2 * MARGIN + 4;
         let middle = (width - 1) / 2;
         vec![
-            Button::new(MARGIN, top, middle - 8, "OK", true),
-            Button::new(middle + 8, top, width - 1 - MARGIN, "Cancel", false),
+            Button::new(MARGIN, top, middle - 8, "ok", true),
+            Button::new(middle + 8, top, width - 1 - MARGIN, "cancel", false),
         ]
     }
 

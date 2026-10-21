@@ -21,8 +21,8 @@ const SQUARE: i32 = 112;
 
 pub fn buttons() -> Vec<Button> {
     vec![
-        Button::new(16, 140, 80, "OK", true),
-        Button::new(96, 140, 160, "None", false),
+        Button::new(16, 140, 80, "ok", true),
+        Button::new(96, 140, 160, "none", false),
     ]
 }
 

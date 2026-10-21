@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 arboard = "3"
+fluent-bundle = "0.16"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "pnm", "tiff", "webp"] }
 fontdb = "0.24"
 fontdue = "0.9"
@@ -15,6 +16,8 @@ rfd = "0.17"
 rustpaint-engine = { path = "../engine" }
 softbuffer = "0.4"
 swash = "0.2"
+sys-locale = "0.3"
+unic-langid = "0.9"
 winit = "0.30"
 
 [target.'cfg(target_os = "macos")'.dependencies]

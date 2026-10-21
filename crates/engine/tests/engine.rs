@@ -707,3 +707,49 @@ fn dither() {
     dither_gray(&[0; 4 * 40], 4, 40, &mut small);
     assert!(count_black(&small) == 4 * 10 && !small.get(4, 0));
 }
+
+/// Where needle first occurs in haystack, from start.
+fn find(haystack: &[u8], needle: &[u8], start: usize) -> usize {
+    start
+        + haystack[start..]
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("found")
+}
+
+#[test]
+fn pdf_pages() {
+    use rustpaint_engine::macpaint_file::unpack_bits;
+    use rustpaint_engine::pdf::write_pdf;
+
+    let mut first = Canvas::default();
+    first.fill_rect(0, 0, 7, 0, BLACK_PATTERN);
+    let pdf = write_pdf(&[first, Canvas::default()]);
+    let text = String::from_utf8_lossy(&pdf);
+    assert!(text.starts_with("%PDF-1.4") && text.ends_with("%%EOF\n"));
+    assert!(text.contains("/Count 2") && text.matches("/Type /Page ").count() == 2);
+    // 576 x 720 points, centered on Letter paper.
+    assert!(text.contains("q 576.00 0 0 720.00 18.00 36.00 cm /Im0 Do Q"));
+
+    // Every object is where the cross-reference table says.
+    let startxref = find(&pdf, b"startxref\n", 0) + 10;
+    let end = find(&pdf, b"\n", startxref);
+    let xref: usize = std::str::from_utf8(&pdf[startxref..end])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let table = std::str::from_utf8(&pdf[xref..]).unwrap();
+    for (number, line) in table.lines().skip(3).take(8).enumerate() {
+        let offset: usize = line[..10].parse().unwrap();
+        assert!(pdf[offset..].starts_with(format!("{} 0 obj", number + 1).as_bytes()));
+    }
+
+    // The first image's data unpacks to the page, black bits first.
+    let image = find(&pdf, b"/RunLengthDecode", 0);
+    let mut position = find(&pdf, b"stream\n", image) + 7;
+    let mut bits = vec![0; 72 * 720];
+    assert!(unpack_bits(&pdf, &mut position, &mut bits));
+    assert_eq!(bits[0], 0xff);
+    assert!(bits[1..].iter().all(|&b| b == 0));
+    assert_eq!(pdf[position], 128);
+}

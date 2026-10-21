@@ -1,17 +1,21 @@
 //! Menu commands, shared by the native menus, the drawn menu bar and the
 //! keyboard shortcuts.
 
+use crate::i18n::{tr, tr_args};
 use crate::typesetter::{Alignment, FONT_SIZES};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
     // File.
+    About,
     New,
     Open,
     Save,
     SaveAs,
     Revert,
     ExportPng,
+    Print,
+    PrintCatalog,
     Quit,
     // Edit.
     Undo,
@@ -55,11 +59,12 @@ pub enum Face {
 
 /// A menu: its title and its commands, in groups between separators.
 pub struct MenuSpec {
-    pub title: &'static str,
+    pub title: String,
     pub groups: Vec<Vec<Command>>,
 }
 
-/// HaikuPaint's menus: File (printing comes with milestone 7), MacPaint's
+/// HaikuPaint's menus: File (with About, as HaikuPaint's; on macOS it goes
+/// in the application menu, with Quit), MacPaint's
 /// Edit menu plus Select All, MacPaint's Goodies (without its Introduction
 /// and Short Cuts screens), and Font, FontSize and Style. The Font menu
 /// lists `font_count` families.
@@ -67,15 +72,17 @@ pub fn menus(font_count: usize) -> Vec<MenuSpec> {
     use Command::*;
     vec![
         MenuSpec {
-            title: "File",
+            title: tr("menu-file"),
             groups: vec![
+                vec![About],
                 vec![New, Open],
                 vec![Save, SaveAs, Revert, ExportPng],
+                vec![Print, PrintCatalog],
                 vec![Quit],
             ],
         },
         MenuSpec {
-            title: "Edit",
+            title: tr("menu-edit"),
             groups: vec![
                 vec![Undo],
                 vec![Cut, Copy, Paste, Clear, SelectAll],
@@ -90,22 +97,22 @@ pub fn menus(font_count: usize) -> Vec<MenuSpec> {
             ],
         },
         MenuSpec {
-            title: "Goodies",
+            title: tr("menu-goodies"),
             groups: vec![
                 vec![Grid, FatBits, ShowPage],
                 vec![EditPattern, BrushShape, BrushMirrors],
             ],
         },
         MenuSpec {
-            title: "Font",
+            title: tr("menu-font"),
             groups: vec![(0..font_count).map(Font).collect()],
         },
         MenuSpec {
-            title: "FontSize",
+            title: tr("menu-font-size"),
             groups: vec![(0..FONT_SIZES.len()).map(FontSize).collect()],
         },
         MenuSpec {
-            title: "Style",
+            title: tr("menu-style"),
             groups: vec![
                 [
                     self::Face::Plain,
@@ -170,47 +177,54 @@ impl Command {
     pub fn label(self, families: &[String]) -> String {
         match self {
             Command::Font(index) => families.get(index).cloned().unwrap_or_default(),
-            Command::FontSize(index) => format!("{} point", FONT_SIZES[index]),
-            command => command.static_label().into(),
+            Command::FontSize(index) => tr_args(
+                "font-size-points",
+                &[("size", &FONT_SIZES[index].to_string())],
+            ),
+            command => tr(command.message_id()),
         }
     }
 
-    fn static_label(self) -> &'static str {
+    /// The Fluent message of the item's text (see crate::i18n).
+    fn message_id(self) -> &'static str {
         match self {
-            Command::New => "New",
-            Command::Open => "Open…",
-            Command::Save => "Save",
-            Command::SaveAs => "Save As…",
-            Command::Revert => "Revert",
-            Command::ExportPng => "Export as PNG…",
-            Command::Quit => "Quit",
-            Command::Undo => "Undo",
-            Command::Cut => "Cut",
-            Command::Copy => "Copy",
-            Command::Paste => "Paste",
-            Command::Clear => "Clear",
-            Command::SelectAll => "Select All",
-            Command::Invert => "Invert",
-            Command::Fill => "Fill",
-            Command::TraceEdges => "Trace Edges",
-            Command::FlipHorizontal => "Flip Horizontal",
-            Command::FlipVertical => "Flip Vertical",
-            Command::Rotate => "Rotate",
-            Command::Grid => "Grid",
-            Command::FatBits => "FatBits",
-            Command::ShowPage => "Show Page",
-            Command::EditPattern => "Edit Pattern…",
-            Command::BrushShape => "Brush Shape…",
-            Command::BrushMirrors => "Brush Mirrors…",
-            Command::Face(Face::Plain) => "Plain",
-            Command::Face(Face::Bold) => "Bold",
-            Command::Face(Face::Italic) => "Italic",
-            Command::Face(Face::Underline) => "Underline",
-            Command::Face(Face::Outline) => "Outline",
-            Command::Face(Face::Shadow) => "Shadow",
-            Command::Align(Alignment::Left) => "Align Left",
-            Command::Align(Alignment::Middle) => "Align Middle",
-            Command::Align(Alignment::Right) => "Align Right",
+            Command::About => "about",
+            Command::New => "new",
+            Command::Open => "open",
+            Command::Save => "save",
+            Command::SaveAs => "save-as",
+            Command::Revert => "revert",
+            Command::ExportPng => "export-png",
+            Command::Print => "print",
+            Command::PrintCatalog => "print-catalog",
+            Command::Quit => "quit",
+            Command::Undo => "undo",
+            Command::Cut => "cut",
+            Command::Copy => "copy",
+            Command::Paste => "paste",
+            Command::Clear => "clear",
+            Command::SelectAll => "select-all",
+            Command::Invert => "invert",
+            Command::Fill => "fill",
+            Command::TraceEdges => "trace-edges",
+            Command::FlipHorizontal => "flip-horizontal",
+            Command::FlipVertical => "flip-vertical",
+            Command::Rotate => "rotate",
+            Command::Grid => "grid",
+            Command::FatBits => "fat-bits",
+            Command::ShowPage => "show-page",
+            Command::EditPattern => "edit-pattern",
+            Command::BrushShape => "brush-shape",
+            Command::BrushMirrors => "brush-mirrors",
+            Command::Face(Face::Plain) => "plain",
+            Command::Face(Face::Bold) => "bold",
+            Command::Face(Face::Italic) => "italic",
+            Command::Face(Face::Underline) => "underline",
+            Command::Face(Face::Outline) => "outline",
+            Command::Face(Face::Shadow) => "shadow",
+            Command::Align(Alignment::Left) => "align-left",
+            Command::Align(Alignment::Middle) => "align-middle",
+            Command::Align(Alignment::Right) => "align-right",
             Command::Font(_) | Command::FontSize(_) => "",
         }
     }
@@ -302,7 +316,7 @@ mod tests {
     #[test]
     fn shortcuts_are_unique_and_found() {
         let commands: Vec<Command> = Command::all().collect();
-        assert_eq!(commands.len(), 25 + FONT_SIZES.len() + 6 + 3);
+        assert_eq!(commands.len(), 28 + FONT_SIZES.len() + 6 + 3);
         for command in &commands {
             if let Some((key, shift)) = command.shortcut() {
                 assert_eq!(
