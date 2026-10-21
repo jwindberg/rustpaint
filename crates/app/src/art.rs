@@ -1,9 +1,9 @@
 //! Drawing MacPaint's interface into 1-bit canvases: PaintFont glyphs,
-//! QuickDraw-style rects, palette boxes and cursors. A port of
+//! QuickDraw-style rects, palette boxes, brush masks and cursors. A port of
 //! HaikuPaint's BitmapUtils.
 
 use rustpaint_engine::paint_font::{Glyph, paint_font_glyph};
-use rustpaint_engine::{BLACK_PATTERN, Canvas, Pattern};
+use rustpaint_engine::{BLACK_PATTERN, Canvas, Mask16, Pattern};
 
 pub const CURSOR_SIZE: usize = 16;
 
@@ -77,6 +77,21 @@ fn glyph_canvas(code: i32) -> Canvas {
     canvas
 }
 
+/// A PaintFont glyph as a 16 x 16 mask; brushes and the spray can paint
+/// through these.
+pub fn mask_from_glyph(code: i32) -> Mask16 {
+    let canvas = glyph_canvas(code);
+    let mut mask = Mask16::default();
+    for y in 0..CURSOR_SIZE {
+        for x in 0..CURSOR_SIZE {
+            if canvas.get(x as i32, y as i32) {
+                mask.rows[y] |= 0x8000 >> x;
+            }
+        }
+    }
+    mask
+}
+
 /// A cursor image built from PaintFont glyphs as MacPaint's SetToolCursor
 /// does, as RGBA, scaled up by a whole number. Pixels set in data are
 /// black; those set only in mask are white; the rest are transparent.
@@ -106,7 +121,9 @@ pub fn glyph_cursor_rgba(data_code: i32, mask_code: i32, scale: usize) -> Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustpaint_engine::paint_font::{GLYPH_SPRAY, PAINT_FONT_HEIGHT};
+    use rustpaint_engine::paint_font::{
+        DEFAULT_BRUSH, GLYPH_FIRST_BRUSH, GLYPH_SPRAY, PAINT_FONT_HEIGHT,
+    };
 
     #[test]
     fn glyph_height_fits_a_cursor() {
@@ -114,7 +131,11 @@ mod tests {
     }
 
     #[test]
-    fn cursors_come_from_glyphs() {
+    fn masks_and_cursors_come_from_glyphs() {
+        let brush = mask_from_glyph(GLYPH_FIRST_BRUSH + DEFAULT_BRUSH);
+        assert!(brush.rows.iter().any(|&row| row != 0));
+        assert_eq!(mask_from_glyph(0), Mask16::default());
+
         let spray = glyph_cursor_rgba(GLYPH_SPRAY, 0, 2);
         assert_eq!(spray.len(), 32 * 32 * 4);
         // Black where the glyph is, transparent elsewhere, never white

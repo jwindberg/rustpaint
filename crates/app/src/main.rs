@@ -24,7 +24,7 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::ModifiersState;
+use winit::keyboard::{Key, ModifiersState};
 use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::art::CURSOR_SIZE;
@@ -189,6 +189,17 @@ impl App {
             self.scroll.0.clamp(0.0, max_x),
             self.scroll.1.clamp(0.0, max_y),
         );
+
+        // Brush Mirrors reflect around the middle of what's visible.
+        let origin = self.scroll_origin();
+        let (page, view) = (self.view.canvas(), &self.layout.page);
+        let visible = Rect::new(
+            origin.x,
+            origin.y,
+            (origin.x + view.width()).min(page.width()),
+            (origin.y + view.height()).min(page.height()),
+        );
+        self.view.set_visible(visible);
     }
 
     /// The page point under a window point.
@@ -275,6 +286,17 @@ impl App {
             self.view
                 .mouse_down(self.page_point(point), self.modifiers());
         }
+    }
+
+    fn key_down(&mut self, key: &Key) {
+        // Command-Z until the Edit menu arrives with milestone 5.
+        if self.modifiers().command
+            && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("z"))
+        {
+            self.view.undo();
+            return;
+        }
+        self.view.key_down();
     }
 
     fn mouse_up(&mut self) {
@@ -552,7 +574,9 @@ impl ApplicationHandler for App {
                     (position.x / scale).floor() as i32,
                     (position.y / scale).floor() as i32,
                 );
-                changed = self.capture == Capture::Page;
+                // A polygon's next edge follows the pointer with the button
+                // up.
+                changed = self.capture == Capture::Page || self.view.polygon_active();
                 if changed {
                     self.view
                         .mouse_moved(self.page_point(self.mouse), self.modifiers());
@@ -567,6 +591,11 @@ impl ApplicationHandler for App {
                 ElementState::Released => self.mouse_up(),
                 _ => {}
             },
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed && !event.repeat {
+                    self.key_down(&event.logical_key);
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => {

@@ -60,6 +60,10 @@ impl Tool {
         (Tool::Rect as usize..=Tool::FilledOval as usize).contains(&(self as usize))
     }
 
+    pub fn is_polygon(self) -> bool {
+        matches!(self, Tool::Polygon | Tool::FilledPolygon)
+    }
+
     /// The tools MacPaint's Grid applies to (its cheapSet: tools 1, 3, 8,
     /// 10-15, 18 and 19).
     pub fn uses_grid(self) -> bool {
