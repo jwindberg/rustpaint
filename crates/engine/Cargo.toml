@@ -1,0 +1,7 @@
+[package]
+name = "rustpaint-engine"
+description = "RustPaint's drawing engine: a 1-bit page, MacPaint's tools and file format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
