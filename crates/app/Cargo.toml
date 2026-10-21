@@ -1,0 +1,12 @@
+[package]
+name = "rustpaint"
+description = "Bill Atkinson's MacPaint, re-created in Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rustpaint-engine = { path = "../engine" }
+softbuffer = "0.4"
+winit = "0.30"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/engine"]
+members = ["crates/engine", "crates/app"]
 resolver = "3"
 
 [workspace.package]
@@ -7,3 +7,11 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["jwindberg"]
+
+# The app redraws the whole window in software every frame; unoptimized
+# builds are too slow for smooth drawing.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
