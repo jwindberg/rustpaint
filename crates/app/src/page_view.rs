@@ -42,6 +42,8 @@ pub struct PageView {
     /// undo, and what live previews are restored from.
     undo: Canvas,
     can_undo: bool,
+    /// Changed since it was opened or saved.
+    dirty: bool,
 
     tool: Tool,
     pattern: Pattern,
@@ -79,6 +81,7 @@ impl PageView {
             visible: Rect::new(0, 0, canvas.width(), canvas.height()),
             canvas,
             can_undo: false,
+            dirty: false,
             tool: Tool::Pencil,
             pattern: BLACK_PATTERN,
             line_width: 1,
@@ -147,6 +150,25 @@ impl PageView {
         self.can_undo
     }
 
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn set_dirty(&mut self, dirty: bool) {
+        self.dirty = dirty;
+    }
+
+    /// Shows a new document: nothing to undo, nothing changed.
+    pub fn set_image(&mut self, image: Canvas) {
+        self.polygon_active = false;
+        self.points.clear();
+        self.tracking = false;
+        self.accept_selection();
+        self.canvas = image;
+        self.can_undo = false;
+        self.dirty = false;
+    }
+
     /// Clears the selection if there is one, else the whole page.
     pub fn clear(&mut self) {
         if self.polygon_active {
@@ -171,6 +193,7 @@ impl PageView {
         }
         std::mem::swap(&mut self.canvas, &mut self.undo);
         self.canvas.set_paint_mode(PaintMode::Copy);
+        self.dirty = true;
     }
 
     /// A key went down; delete is Backspace or Delete. Returns whether the
@@ -374,10 +397,12 @@ impl PageView {
         self.canvas.set_paint_mode(PaintMode::Copy);
     }
 
-    /// Called before anything changes the canvas: saves the undo image.
+    /// Called before anything changes the canvas: saves the undo image and
+    /// marks the document dirty.
     fn begin_operation(&mut self) {
         self.undo = self.canvas.clone();
         self.can_undo = true;
+        self.dirty = true;
     }
 
     // Live previews: the canvas is restored from the undo image under the

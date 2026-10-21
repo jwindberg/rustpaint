@@ -8,6 +8,9 @@ authors.workspace = true
 
 [dependencies]
 arboard = "3"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "pnm", "tiff", "webp"] }
+fontdue = "0.9"
+rfd = "0.17"
 rustpaint-engine = { path = "../engine" }
 softbuffer = "0.4"
 winit = "0.30"

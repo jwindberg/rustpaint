@@ -60,11 +60,11 @@ Suggested crates (check the current versions):
 |---|---|
 | Window, input, custom cursors | `winit` |
 | Pixel buffer to window | `softbuffer` (or `pixels`) |
-| Native menus | `muda` (Linux needs GTK) |
+| Menus | `muda` on macOS; on Linux and Windows a menu bar drawn in the window, as PhotoCraft does (`menu_bar.rs`), with Ctrl shortcuts |
 | File dialogs | `rfd` |
 | Clipboard (images) | `arboard` |
 | PNG and image import/export | `image` |
-| Text tool rendering | `fontdue` with a bundled TTF (1-bit: threshold the coverage) |
+| Text | `fontdue`. The drawn menus use Inter (OFL), anti-aliased at full resolution; 1-bit text thresholded from TrueType looked bad, so the text tool needs its own decision |
 | Translations | `fluent` + `fluent-langneg` + `sys-locale` |
 | Printing | none good cross-platform: export a PDF (`printpdf`) and open it |
 

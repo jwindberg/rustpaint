@@ -5,14 +5,19 @@
 mod art;
 mod clipboard;
 mod commands;
+mod documents;
+mod images;
+mod menu_bar;
 #[cfg(target_os = "macos")]
 mod menus;
 mod page_view;
 mod palettes;
+mod text;
 mod tool;
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -33,13 +38,20 @@ use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::art::CURSOR_SIZE;
 use crate::clipboard::Clipboard;
-use crate::commands::Command;
+use crate::commands::{Command, MenuState};
+use crate::documents::{MACPAINT_EXTENSIONS, export_png, load_document, save_macpaint};
 use crate::page_view::{Modifiers, PageView, SelectionCommand, ant_bit};
 use crate::palettes::{line_widths, patterns, tools};
 use crate::tool::Tool;
 
 /// Space around and between the palettes and the page.
 const MARGIN: i32 = 6;
+/// Linux and Windows get a menu bar drawn in the window, as PhotoCraft
+/// does: winit's Linux windows can't have native menus, and drawing them
+/// keeps the two alike. macOS has the system's menu bar.
+const DRAWN_MENUS: bool = !cfg!(target_os = "macos");
+/// The window's top, above everything else: the drawn menu bar.
+const TOP: i32 = if DRAWN_MENUS { menu_bar::HEIGHT } else { 0 };
 /// The window's background, and the area beyond the page's edges.
 const PANEL_COLOR: u32 = 0xd8d8d8;
 const OUTSIDE_PAGE_COLOR: u32 = 0x989898;
@@ -52,6 +64,8 @@ const LINE_SCROLL: f64 = 16.0;
 /// MacPaint stepped its ants every tick (1/60 s); a little slower is
 /// kinder.
 const ANTS_INTERVAL: Duration = Duration::from_millis(40);
+
+const UNTITLED: &str = "untitled";
 
 /// Events from outside the window.
 #[derive(Debug)]
@@ -78,16 +92,16 @@ impl Layout {
         let page_bottom = (height - MARGIN - pattern_height - MARGIN).max(MARGIN + 1);
         let patterns = Point::new(page_left, page_bottom + MARGIN);
         Self {
-            tools: Point::new(MARGIN, MARGIN),
+            tools: Point::new(MARGIN, TOP + MARGIN),
             lines: Point::new(
                 MARGIN,
                 patterns.y + pattern_height - (line_widths::HEIGHT + 1),
             ),
             page: Rect::new(
                 page_left,
-                MARGIN,
+                TOP + MARGIN,
                 (width - MARGIN).max(page_left + 1),
-                page_bottom,
+                page_bottom.max(TOP + MARGIN + 1),
             ),
             patterns,
         }
@@ -96,7 +110,7 @@ impl Layout {
     /// The smallest window everything fits in.
     fn minimum_size() -> LogicalSize<i32> {
         let width = MARGIN + tools::WIDTH + 1 + MARGIN + patterns::WIDTH + 1 + MARGIN;
-        let height = MARGIN + tools::HEIGHT + 1 + MARGIN + line_widths::HEIGHT + 1 + MARGIN;
+        let height = TOP + MARGIN + tools::HEIGHT + 1 + MARGIN + line_widths::HEIGHT + 1 + MARGIN;
         LogicalSize::new(width, height)
     }
 }
@@ -115,6 +129,7 @@ enum CursorKind {
 enum Capture {
     None,
     Page,
+    Menu,
 }
 
 /// Something that reacts to a double-click.
@@ -154,8 +169,17 @@ struct App {
     next_ants: Instant,
 
     clipboard: Clipboard,
+    /// The drawn menu bar, where there are no native menus.
+    menu_bar: Option<menu_bar::MenuBar>,
     #[cfg(target_os = "macos")]
     menus: Option<menus::MenuBar>,
+
+    /// The file Save writes to; only set for MacPaint documents, so an
+    /// opened PNG is never overwritten in MacPaint format.
+    path: Option<PathBuf>,
+    /// The document's name, in the title bar.
+    name: String,
+    quit_requested: bool,
 }
 
 impl App {
@@ -179,8 +203,12 @@ impl App {
             last_click: None,
             next_ants: Instant::now(),
             clipboard: Clipboard::new(),
+            menu_bar: DRAWN_MENUS.then(menu_bar::MenuBar::new),
             #[cfg(target_os = "macos")]
             menus: None,
+            path: None,
+            name: UNTITLED.into(),
+            quit_requested: false,
         }
     }
 
@@ -282,6 +310,13 @@ impl App {
 
     fn mouse_down(&mut self) {
         let point = self.mouse;
+        let state = self.menu_state();
+        if let Some(bar) = &mut self.menu_bar
+            && bar.mouse_down(point, state)
+        {
+            self.capture = Capture::Menu;
+            return;
+        }
         let at = |origin: Point| (point.x - origin.x, point.y - origin.y);
 
         let (x, y) = at(self.layout.tools);
@@ -319,13 +354,20 @@ impl App {
     }
 
     fn key_down(&mut self, key: &Key) {
-        if self.modifiers().command {
-            // On macOS the menus take their shortcuts before the window
-            // sees them; elsewhere they're handled here until milestone 5
-            // brings menus there too.
-            if !cfg!(target_os = "macos")
-                && let Key::Character(text) = key
-                && let Some(command) = text.chars().next().and_then(Command::from_shortcut)
+        // Menu shortcuts: Command on macOS, where the menus mostly take them
+        // before the window sees them, and Ctrl elsewhere.
+        let state = self.modifiers;
+        let shortcut = if cfg!(target_os = "macos") {
+            state.super_key()
+        } else {
+            state.control_key()
+        };
+        if shortcut {
+            if let Key::Character(text) = key
+                && let Some(command) = text
+                    .chars()
+                    .next()
+                    .and_then(|key| Command::from_shortcut(key, state.shift_key()))
             {
                 self.run(command);
             }
@@ -346,6 +388,25 @@ impl App {
             _ => None,
         };
         match command {
+            Command::New => {
+                if self.confirm_discard() {
+                    self.new_document();
+                }
+            }
+            Command::Open => self.open(),
+            Command::Save => {
+                self.save();
+            }
+            Command::SaveAs => {
+                self.save_as();
+            }
+            Command::Revert => self.revert(),
+            Command::ExportPng => self.export(),
+            Command::Quit => {
+                if self.confirm_discard() {
+                    self.quit_requested = true;
+                }
+            }
             Command::Undo => self.view.undo(),
             Command::Cut | Command::Copy => {
                 if let Some(selection) = self.view.selection() {
@@ -376,6 +437,196 @@ impl App {
         self.request_redraw();
     }
 
+    fn menu_state(&self) -> MenuState {
+        MenuState {
+            can_undo: self.view.can_undo(),
+            has_selection: self.view.has_selection(),
+            can_revert: self.path.is_some() && self.view.is_dirty(),
+        }
+    }
+
+    fn window(&self) -> Option<&Window> {
+        self.graphics.as_ref().map(|graphics| &*graphics.window)
+    }
+
+    fn file_dialog(&self) -> rfd::FileDialog {
+        let dialog = rfd::FileDialog::new();
+        match self.window() {
+            Some(window) => dialog.set_parent(window),
+            None => dialog,
+        }
+    }
+
+    fn message_dialog(&self, title: &str, text: &str) -> rfd::MessageDialog {
+        let dialog = rfd::MessageDialog::new()
+            .set_title(title)
+            .set_description(text);
+        match self.window() {
+            Some(window) => dialog.set_parent(window),
+            None => dialog,
+        }
+    }
+
+    fn show_error(&self, text: &str) {
+        self.message_dialog("Error", text)
+            .set_level(rfd::MessageLevel::Error)
+            .show();
+    }
+
+    /// Asks about unsaved changes. Returns whether the caller may go
+    /// ahead.
+    fn confirm_discard(&mut self) -> bool {
+        if !self.view.is_dirty() {
+            return true;
+        }
+        let text = format!("Save changes to the document \"{}\"?", self.name);
+        let dialog = self
+            .message_dialog("Unsaved changes", &text)
+            .set_level(rfd::MessageLevel::Warning);
+        // Windows needs a manifest for custom labels; Yes and No stand in.
+        let buttons = if cfg!(target_os = "windows") {
+            rfd::MessageButtons::YesNoCancel
+        } else {
+            rfd::MessageButtons::YesNoCancelCustom(
+                "Save".into(),
+                "Don't Save".into(),
+                "Cancel".into(),
+            )
+        };
+        match dialog.set_buttons(buttons).show() {
+            rfd::MessageDialogResult::Yes => self.save(),
+            rfd::MessageDialogResult::No => true,
+            rfd::MessageDialogResult::Custom(label) if label == "Save" => self.save(),
+            rfd::MessageDialogResult::Custom(label) if label == "Don't Save" => true,
+            _ => false,
+        }
+    }
+
+    fn new_document(&mut self) {
+        self.view.set_image(Canvas::default());
+        self.set_patterns(PATTERNS);
+        self.path = None;
+        self.set_name(UNTITLED.into());
+    }
+
+    fn open(&mut self) {
+        if !self.confirm_discard() {
+            return;
+        }
+        let path = self
+            .file_dialog()
+            .add_filter("MacPaint documents", &MACPAINT_EXTENSIONS)
+            .add_filter(
+                "Images",
+                &[
+                    "png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "webp", "pbm", "pgm", "ppm",
+                ],
+            )
+            .add_filter("All files", &["*"])
+            .pick_file();
+        if let Some(path) = path {
+            self.open_path(&path);
+        }
+    }
+
+    fn open_path(&mut self, path: &Path) {
+        match load_document(path) {
+            Ok(document) => {
+                self.view.set_image(document.canvas);
+                self.set_patterns(document.patterns);
+                self.path = document.is_macpaint.then(|| path.to_path_buf());
+                self.set_name(file_name(path));
+            }
+            Err(error) => self.show_error(&error),
+        }
+    }
+
+    /// Saves to the document's file, or asks where. Returns whether it was
+    /// saved.
+    fn save(&mut self) -> bool {
+        let Some(path) = self.path.clone() else {
+            return self.save_as();
+        };
+        match save_macpaint(&path, self.view.canvas(), &self.patterns) {
+            Ok(()) => {
+                self.view.set_dirty(false);
+                true
+            }
+            Err(error) => {
+                self.show_error(&error);
+                false
+            }
+        }
+    }
+
+    fn save_as(&mut self) -> bool {
+        // Suggest a MacPaint name, also for an image opened from another
+        // format.
+        let name = if self.path.is_some() {
+            self.name.clone()
+        } else {
+            format!("{}.mac", stem(&self.name))
+        };
+        let Some(path) = self
+            .file_dialog()
+            .set_file_name(name)
+            .add_filter("MacPaint document", &MACPAINT_EXTENSIONS)
+            .save_file()
+        else {
+            return false;
+        };
+        if let Err(error) = save_macpaint(&path, self.view.canvas(), &self.patterns) {
+            self.show_error(&error);
+            return false;
+        }
+        self.view.set_dirty(false);
+        self.set_name(file_name(&path));
+        self.path = Some(path);
+        true
+    }
+
+    fn revert(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        // MacPaint's Revert alert.
+        let answer = self
+            .message_dialog("Revert", "Revert to the last version saved?")
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show();
+        if answer == rfd::MessageDialogResult::Ok {
+            self.open_path(&path);
+        }
+    }
+
+    fn export(&mut self) {
+        let path = self
+            .file_dialog()
+            .set_file_name(format!("{}.png", stem(&self.name)))
+            .add_filter("PNG image", &["png"])
+            .save_file();
+        if let Some(path) = path
+            && let Err(error) = export_png(&path, self.view.canvas())
+        {
+            self.show_error(&error);
+        }
+    }
+
+    /// The document's patterns, saved with it.
+    fn set_patterns(&mut self, patterns: [Pattern; PATTERN_COUNT]) {
+        self.patterns = patterns;
+        self.view.set_pattern(patterns[self.pattern_index]);
+        self.pattern_palette = patterns::render(&self.patterns, self.pattern_index);
+    }
+
+    fn set_name(&mut self, name: String) {
+        if let Some(window) = self.window() {
+            window.set_title(&name);
+        }
+        self.name = name;
+    }
+
     fn request_redraw(&self) {
         if let Some(graphics) = &self.graphics {
             graphics.window.request_redraw();
@@ -383,14 +634,30 @@ impl App {
     }
 
     fn mouse_up(&mut self) {
-        if self.capture == Capture::Page {
-            self.view
-                .mouse_up(self.page_point(self.mouse), self.modifiers());
+        match self.capture {
+            Capture::Page => {
+                self.view
+                    .mouse_up(self.page_point(self.mouse), self.modifiers());
+            }
+            Capture::Menu => {
+                let state = self.menu_state();
+                let command = self
+                    .menu_bar
+                    .as_mut()
+                    .and_then(|bar| bar.mouse_up(self.mouse, state));
+                if let Some(command) = command {
+                    self.run(command);
+                }
+            }
+            Capture::None => {}
         }
         self.capture = Capture::None;
     }
 
     fn cursor_kind(&self) -> CursorKind {
+        if self.menu_bar.as_ref().is_some_and(|bar| bar.is_open()) {
+            return CursorKind::Arrow;
+        }
         if self.capture != Capture::Page && !self.in_page_view(self.mouse) {
             return CursorKind::Arrow;
         }
@@ -440,26 +707,13 @@ impl App {
     /// Composes the window at logical resolution.
     fn render(&self, frame: &mut [u32], width: i32, height: i32) {
         frame.fill(PANEL_COLOR);
-        let mut blit = |canvas: &Canvas, origin: Point| {
-            let (w, h) = (canvas.width(), canvas.height());
-            for y in 0..h {
-                for x in 0..w {
-                    // The two corners the drop shadow doesn't reach show
-                    // the background.
-                    if (x == w - 1 && y == 0) || (x == 0 && y == h - 1) {
-                        continue;
-                    }
-                    let (fx, fy) = (origin.x + x, origin.y + y);
-                    if fx >= 0 && fy >= 0 && fx < width && fy < height {
-                        frame[(fy * width + fx) as usize] =
-                            if canvas.get(x, y) { BLACK } else { WHITE };
-                    }
-                }
-            }
-        };
-        blit(&self.tool_palette, self.layout.tools);
-        blit(&self.line_palette, self.layout.lines);
-        blit(&self.pattern_palette, self.layout.patterns);
+        for (canvas, origin) in [
+            (&self.tool_palette, self.layout.tools),
+            (&self.line_palette, self.layout.lines),
+            (&self.pattern_palette, self.layout.patterns),
+        ] {
+            blit(frame, width, height, canvas, origin, true);
+        }
 
         let view = &self.layout.page;
         let page = self.view.canvas();
@@ -494,10 +748,26 @@ impl App {
                 frame[(y * width + x) as usize] = if black { BLACK } else { WHITE };
             }
         }
+
+        // The menus go over everything.
+        if let Some(bar) = &self.menu_bar {
+            blit(
+                frame,
+                width,
+                height,
+                &bar.render_bar(width),
+                Point::default(),
+                false,
+            );
+            if let Some((origin, menu)) = bar.render_menu() {
+                blit(frame, width, height, &menu, origin, true);
+            }
+        }
     }
 
     fn redraw(&mut self) {
         let scale = self.scale as usize;
+        let menu_state = self.menu_state();
         let mut logical = Vec::new();
         let Some(graphics) = &mut self.graphics else {
             return;
@@ -537,6 +807,17 @@ impl App {
             for copy in 1..scale {
                 buffer.copy_within(first..first + physical_width, first + copy * physical_width);
             }
+        }
+
+        // The menus' text goes on at full resolution.
+        if let Some(bar) = &self.menu_bar {
+            bar.draw_text(
+                &mut buffer,
+                physical_width,
+                physical_height,
+                self.scale,
+                menu_state,
+            );
         }
         buffer.present().expect("presenting the frame");
     }
@@ -628,10 +909,6 @@ impl ApplicationHandler<UserEvent> for App {
         if self.graphics.is_some() {
             return;
         }
-        #[cfg(target_os = "macos")]
-        {
-            self.menus = Some(menus::MenuBar::install());
-        }
         let page_height = Canvas::DEFAULT_HEIGHT;
         let attributes = Window::default_attributes()
             .with_title("untitled")
@@ -657,12 +934,28 @@ impl ApplicationHandler<UserEvent> for App {
         });
         self.relayout();
         self.create_cursors(event_loop);
+
+        #[cfg(target_os = "macos")]
+        {
+            let menus = menus::MenuBar::new();
+            menus.install();
+            self.menus = Some(menus);
+        }
+
+        // A document named on the command line.
+        if let Some(path) = std::env::args_os().nth(1) {
+            self.open_path(Path::new(&path));
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let mut changed = true;
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if self.confirm_discard() {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Resized(_) => self.relayout(),
             WindowEvent::ScaleFactorChanged { .. } => {
                 self.relayout();
@@ -684,6 +977,17 @@ impl ApplicationHandler<UserEvent> for App {
                 );
                 // A polygon's next edge follows the pointer with the button
                 // up.
+                if let Some(bar) = &mut self.menu_bar
+                    && bar.is_open()
+                {
+                    let state = self.menu_state();
+                    if let Some(bar) = &mut self.menu_bar {
+                        bar.mouse_moved(self.mouse, state);
+                    }
+                    self.update_cursor();
+                    self.request_redraw();
+                    return;
+                }
                 changed = self.capture == Capture::Page || self.view.polygon_active();
                 if changed {
                     self.view
@@ -748,9 +1052,13 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.quit_requested {
+            event_loop.exit();
+            return;
+        }
         #[cfg(target_os = "macos")]
         if let Some(menus) = &self.menus {
-            menus.update(self.view.can_undo(), self.view.has_selection());
+            menus.update(self.menu_state());
         }
 
         // March the ants while there are any.
@@ -788,4 +1096,44 @@ fn main() {
     event_loop
         .run_app(&mut app)
         .expect("running the event loop");
+}
+
+/// The file's name, for the title bar.
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| UNTITLED.into())
+}
+
+/// A name without its extension.
+fn stem(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 => &name[..dot],
+        _ => name,
+    }
+}
+
+/// Draws a 1-bit canvas into the frame at origin. A shadowed canvas is a
+/// palette box (see art::draw_palette_box): the two corners its drop
+/// shadow doesn't reach show the background.
+fn blit(
+    frame: &mut [u32],
+    width: i32,
+    height: i32,
+    canvas: &Canvas,
+    origin: Point,
+    shadowed: bool,
+) {
+    let (w, h) = (canvas.width(), canvas.height());
+    for y in 0..h {
+        for x in 0..w {
+            if shadowed && ((x == w - 1 && y == 0) || (x == 0 && y == h - 1)) {
+                continue;
+            }
+            let (fx, fy) = (origin.x + x, origin.y + y);
+            if fx >= 0 && fy >= 0 && fx < width && fy < height {
+                frame[(fy * width + fx) as usize] = if canvas.get(x, y) { BLACK } else { WHITE };
+            }
+        }
+    }
 }

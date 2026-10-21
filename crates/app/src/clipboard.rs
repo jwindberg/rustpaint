@@ -6,8 +6,9 @@
 
 use std::borrow::Cow;
 
-use rustpaint_engine::dither::dither_gray;
 use rustpaint_engine::{Canvas, Rect, Selection};
+
+use crate::images::dither_rgba;
 
 pub struct Clipboard {
     system: Option<arboard::Clipboard>,
@@ -80,9 +81,8 @@ fn selection_rgba(selection: &Selection) -> Vec<u8> {
     rgba
 }
 
-/// Converts an RGBA image to black and white, cropped to the page:
-/// transparent counts as white, and grays are dithered. None if the image
-/// is empty or its data is short.
+/// An RGBA image in black and white, cropped to fit the page. None if the
+/// image is empty or its data is short.
 fn canvas_from_rgba(
     rgba: &[u8],
     width: usize,
@@ -90,28 +90,14 @@ fn canvas_from_rgba(
     page_width: i32,
     page_height: i32,
 ) -> Option<Canvas> {
-    if width == 0 || height == 0 || rgba.len() < width * height * 4 {
+    if width == 0 || height == 0 {
         return None;
     }
-    // Only the part that fits matters.
-    let fit_width = width.min(page_width as usize);
-    let fit_height = height.min(page_height as usize);
-    let mut gray = Vec::with_capacity(fit_width * fit_height);
-    for y in 0..fit_height {
-        for x in 0..fit_width {
-            let pixel = &rgba[(y * width + x) * 4..][..4];
-            let luminance =
-                (299 * pixel[0] as u32 + 587 * pixel[1] as u32 + 114 * pixel[2] as u32) / 1000;
-            gray.push(if pixel[3] >= 128 {
-                luminance as u8
-            } else {
-                255
-            });
-        }
-    }
-    let mut canvas = Canvas::new(fit_width as i32, fit_height as i32);
-    dither_gray(&gray, fit_width as i32, fit_height as i32, &mut canvas);
-    Some(canvas)
+    let mut canvas = Canvas::new(
+        (width as i32).min(page_width),
+        (height as i32).min(page_height),
+    );
+    dither_rgba(rgba, width, height, &mut canvas).then_some(canvas)
 }
 
 #[cfg(test)]
