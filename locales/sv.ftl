@@ -74,3 +74,7 @@ filter-macpaint-documents = MacPaint-dokument
 filter-images = Bilder
 filter-all = Alla filer
 filter-png = PNG-bild
+services = Tjänster
+hide-app = Göm RustPaint
+hide-others = Göm övriga
+show-all = Visa alla

@@ -6,6 +6,10 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "RustPaint"
+path = "src/main.rs"
+
 [dependencies]
 arboard = "3"
 fluent-bundle = "0.16"

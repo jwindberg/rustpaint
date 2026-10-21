@@ -2,7 +2,7 @@
 Type=Application
 Name=RustPaint
 Comment=Bill Atkinson's MacPaint, re-created
-Exec=rustpaint %f
+Exec=RustPaint %f
 Icon=rustpaint
 Categories=Graphics;2DGraphics;RasterGraphics;
 MimeType=image/x-macpaint;image/png;

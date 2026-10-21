@@ -26,9 +26,9 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           app=RustPaint.app/Contents
           mkdir -p "$app/MacOS" "$app/Resources"
-          lipo -create -output "$app/MacOS/rustpaint" \
-            target/aarch64-apple-darwin/release/rustpaint \
-            target/x86_64-apple-darwin/release/rustpaint
+          lipo -create -output "$app/MacOS/RustPaint" \
+            target/aarch64-apple-darwin/release/RustPaint \
+            target/x86_64-apple-darwin/release/RustPaint
           sed "s/VERSION/$version/g" packaging/macos/Info.plist > "$app/Info.plist"
           cargo run --release -p rustpaint --example make_icons -- icons
           iconset=RustPaint.iconset
@@ -56,10 +56,10 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           cargo run --release -p rustpaint --example make_icons -- icons
           mkdir -p AppDir/usr/bin
-          cp target/release/rustpaint AppDir/usr/bin/
+          cp target/release/RustPaint AppDir/usr/bin/
           cp packaging/linux/rustpaint.desktop AppDir/
           cp icons/icon_256.png AppDir/rustpaint.png
-          ln -s usr/bin/rustpaint AppDir/AppRun
+          ln -s usr/bin/RustPaint AppDir/AppRun
           curl -sSfL -o appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
@@ -81,7 +81,7 @@ jobs:
         run: |
           $version = "$env:GITHUB_REF_NAME".TrimStart("v")
           New-Item -ItemType Directory RustPaint | Out-Null
-          Copy-Item target/release/rustpaint.exe RustPaint/RustPaint.exe
+          Copy-Item target/release/RustPaint.exe RustPaint/
           Copy-Item LICENSE, ATTRIBUTION.md, assets/fonts/OFL-Inter.txt RustPaint/
           Compress-Archive RustPaint "RustPaint-$version-windows-x64.zip"
       - uses: actions/upload-artifact@v4

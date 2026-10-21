@@ -124,11 +124,20 @@ MESSAGES = [
     ('filter-images', 'Images', None),
     ('filter-all', 'All files', None),
     ('filter-png', 'PNG image', None),
+    # macOS's application menu.
+    ('services', 'Services', None),
+    ('hide-app', 'Hide RustPaint', None),
+    ('hide-others', 'Hide Others', None),
+    ('show-all', 'Show All', None),
 ]
 
 # Translations of the messages HaikuPaint has no string for.
 OWN = {
     'de': {
+        'services': 'Dienste',
+        'hide-app': 'RustPaint ausblenden',
+        'hide-others': 'Andere ausblenden',
+        'show-all': 'Alle einblenden',
         'error-print': 'Drucken nicht möglich: { $error }',
         'error-print-open':
             'Das PDF zum Drucken konnte nicht geöffnet werden: { $error }',
@@ -138,6 +147,10 @@ OWN = {
         'filter-png': 'PNG-Bild',
     },
     'fr': {
+        'services': 'Services',
+        'hide-app': 'Masquer RustPaint',
+        'hide-others': 'Masquer les autres',
+        'show-all': 'Tout afficher',
         'error-print': "Impossible d'imprimer : { $error }",
         'error-print-open':
             "Impossible d'ouvrir le PDF pour l'imprimer : { $error }",
@@ -147,6 +160,10 @@ OWN = {
         'filter-png': 'Image PNG',
     },
     'es': {
+        'services': 'Servicios',
+        'hide-app': 'Ocultar RustPaint',
+        'hide-others': 'Ocultar otros',
+        'show-all': 'Mostrar todo',
         'error-print': 'No se pudo imprimir: { $error }',
         'error-print-open':
             'No se pudo abrir el PDF para imprimirlo: { $error }',
@@ -156,6 +173,10 @@ OWN = {
         'filter-png': 'Imagen PNG',
     },
     'sv': {
+        'services': 'Tjänster',
+        'hide-app': 'Göm RustPaint',
+        'hide-others': 'Göm övriga',
+        'show-all': 'Visa alla',
         'error-print': 'Kunde inte skriva ut: { $error }',
         'error-print-open':
             'Kunde inte öppna PDF-filen för utskrift: { $error }',

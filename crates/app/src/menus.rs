@@ -5,6 +5,7 @@ use muda::accelerator::{Accelerator, Code, Modifiers};
 use muda::{CheckMenuItem, IsMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 
 use crate::commands::{Command, MenuState, menus};
+use crate::i18n::tr;
 
 /// An item, plain or with a check mark.
 enum Item {
@@ -49,11 +50,11 @@ impl MenuBar {
             let _ = app_menu.append_items(&[
                 about.as_menu_item(),
                 &PredefinedMenuItem::separator(),
-                &PredefinedMenuItem::services(None),
+                &PredefinedMenuItem::services(Some(&tr("services"))),
                 &PredefinedMenuItem::separator(),
-                &PredefinedMenuItem::hide(None),
-                &PredefinedMenuItem::hide_others(None),
-                &PredefinedMenuItem::show_all(None),
+                &PredefinedMenuItem::hide(Some(&tr("hide-app"))),
+                &PredefinedMenuItem::hide_others(Some(&tr("hide-others"))),
+                &PredefinedMenuItem::show_all(Some(&tr("show-all"))),
                 &PredefinedMenuItem::separator(),
                 quit.as_menu_item(),
             ]);

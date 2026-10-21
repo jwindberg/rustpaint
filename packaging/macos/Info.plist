@@ -9,7 +9,7 @@
 	<key>CFBundleIdentifier</key>
 	<string>io.github.jwindberg.rustpaint</string>
 	<key>CFBundleExecutable</key>
-	<string>rustpaint</string>
+	<string>RustPaint</string>
 	<key>CFBundleIconFile</key>
 	<string>RustPaint</string>
 	<key>CFBundlePackageType</key>
