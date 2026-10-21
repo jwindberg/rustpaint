@@ -64,7 +64,7 @@ Suggested crates (check the current versions):
 | File dialogs | `rfd` |
 | Clipboard (images) | `arboard` |
 | PNG and image import/export | `image` |
-| Text | `fontdue`. The drawn menus use Inter (OFL), anti-aliased at full resolution; 1-bit text thresholded from TrueType looked bad, so the text tool needs its own decision |
+| Text | Text tool: the system's fonts (`fontdb`), hinted by `swash` and thresholded at 96/255, as HaikuPaint uses system fonts with anti-aliasing off. Drawn menus and dialog buttons: Inter (OFL) via `fontdue`, anti-aliased at full resolution |
 | Translations | `fluent` + `fluent-langneg` + `sys-locale` |
 | Printing | none good cross-platform: export a PDF (`printpdf`) and open it |
 

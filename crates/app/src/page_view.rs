@@ -5,7 +5,7 @@
 
 use rustpaint_engine::canvas::mask_stroke_points;
 use rustpaint_engine::geometry::{AxisLock, constrain, near_point, snap_to_grid};
-use rustpaint_engine::paint_font::{DEFAULT_BRUSH, GLYPH_FIRST_BRUSH, GLYPH_SPRAY};
+use rustpaint_engine::paint_font::{BRUSH_COUNT, DEFAULT_BRUSH, GLYPH_FIRST_BRUSH, GLYPH_SPRAY};
 use rustpaint_engine::symmetry::{NO_SYMMETRY, symmetric_points};
 use rustpaint_engine::{
     BLACK_PATTERN, Canvas, Mask16, PaintMode, Pattern, Point, Rect, Shape, WHITE_PATTERN,
@@ -15,9 +15,12 @@ use crate::art::mask_from_glyph;
 use crate::tool::Tool;
 
 mod selection;
+mod text;
 
 use selection::{Drag, SelectionState};
 pub use selection::{SelectionCommand, ant_bit};
+pub use text::TextKey;
+use text::TextState;
 
 /// MacPaint's eraser is its 16 x 16 cursor box, centered on the hotspot.
 const ERASER_SIZE: i32 = 16;
@@ -49,10 +52,13 @@ pub struct PageView {
     pattern: Pattern,
     line_width: i32,
     border: bool,
+    brush: i32,
     brush_mask: Mask16,
     spray_mask: Mask16,
     grid: bool,
     symmetry: u8,
+    /// Page pixels to a screen pixel: 1, or 8 in FatBits.
+    zoom: i32,
     mirror_center: Point,
     /// The part of the page in the window.
     visible: Rect,
@@ -71,6 +77,7 @@ pub struct PageView {
     /// The selection, if there is one, and the overlays drawn over the
     /// page but not into it: marching ants and the lasso's trail.
     sel: SelectionState,
+    text: TextState,
 }
 
 impl PageView {
@@ -86,9 +93,11 @@ impl PageView {
             pattern: BLACK_PATTERN,
             line_width: 1,
             border: true,
+            brush: DEFAULT_BRUSH,
             brush_mask: mask_from_glyph(GLYPH_FIRST_BRUSH + DEFAULT_BRUSH),
             spray_mask: mask_from_glyph(GLYPH_SPRAY),
             grid: false,
+            zoom: 1,
             symmetry: NO_SYMMETRY,
             mirror_center: Point::default(),
             tracking: false,
@@ -100,6 +109,7 @@ impl PageView {
             points: Vec::new(),
             polygon_active: false,
             sel: SelectionState::default(),
+            text: TextState::default(),
         }
     }
 
@@ -134,6 +144,53 @@ impl PageView {
     pub fn set_line_width(&mut self, width: i32, border: bool) {
         self.line_width = width;
         self.border = border;
+    }
+
+    pub fn brush(&self) -> i32 {
+        self.brush
+    }
+
+    /// One of the 32 brush shapes, from PaintFont.
+    pub fn set_brush(&mut self, brush: i32) {
+        if (0..BRUSH_COUNT).contains(&brush) {
+            self.brush = brush;
+            self.brush_mask = mask_from_glyph(GLYPH_FIRST_BRUSH + brush);
+        }
+    }
+
+    /// Goodies > Grid: snaps the tools MacPaint snaps to 8 pixels.
+    pub fn set_grid(&mut self, grid: bool) {
+        self.grid = grid;
+    }
+
+    /// Goodies > Brush Mirrors, as a `map_symmetry` byte.
+    pub fn set_symmetry(&mut self, symmetry: u8) {
+        self.symmetry = symmetry;
+    }
+
+    /// FatBits magnifies by 8; the eraser then covers 2 x 2 page pixels.
+    pub fn set_zoom(&mut self, zoom: i32) {
+        self.zoom = zoom.max(1);
+    }
+
+    /// Ends what's in progress, a polygon or a selection, before something
+    /// that changes the whole view.
+    pub fn finish_editing(&mut self) {
+        if self.polygon_active {
+            self.finish_polygon(false);
+        }
+        self.accept_selection();
+    }
+
+    /// Show Page's page shift: moves the whole drawing, losing what goes
+    /// off the page.
+    pub fn offset_page(&mut self, dx: i32, dy: i32) {
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        self.finish_editing();
+        self.begin_operation();
+        self.canvas.offset(dx, dy);
     }
 
     pub fn set_visible(&mut self, visible: Rect) {
@@ -213,12 +270,18 @@ impl PageView {
     }
 
     pub fn mouse_down(&mut self, unsnapped: Point, modifiers: Modifiers) {
-        // The grabber and text arrive in later milestones.
-        if matches!(self.tool, Tool::Grabber | Tool::Text) {
+        // The window scrolls for the grabber.
+        if self.tool == Tool::Grabber {
             return;
         }
 
         let point = self.tool_point(unsnapped);
+        if self.tool == Tool::Text {
+            // A new block of text starts here.
+            self.accept_selection();
+            self.place_caret(point);
+            return;
+        }
         self.tracking = true;
 
         if self.tool.is_selection() {
@@ -573,14 +636,16 @@ impl PageView {
     }
 
     fn erase(&mut self, from: Point, to: Point) {
-        // Center the eraser square on the pointer.
-        let half = ERASER_SIZE / 2;
+        // Center the eraser square on the pointer. In FatBits it erases what
+        // its 16 pixel box covers: 2 x 2 page pixels.
+        let size = (ERASER_SIZE / self.zoom).max(1);
+        let half = size / 2;
         self.canvas.stroke_line(
             from.x - half,
             from.y - half,
             to.x - half,
             to.y - half,
-            ERASER_SIZE,
+            size,
             WHITE_PATTERN,
         );
     }
@@ -858,5 +923,49 @@ mod tests {
         assert_eq!(black_count(&view), 0);
         view.undo();
         assert_eq!(black_count(&view), 10);
+    }
+
+    #[test]
+    fn grid_brushes_mirrors_and_the_page_shift() {
+        // The grid snaps the line tool's ends to multiples of 8.
+        let mut view = view_with(Tool::Line);
+        view.set_grid(true);
+        drag(&mut view, &[(13, 10), (30, 11)], NONE);
+        assert!(view.canvas().get(16, 8) && view.canvas().get(32, 8));
+        assert!(!view.canvas().get(13, 10));
+
+        // A different brush paints a different footprint.
+        let footprint = |brush| {
+            let mut view = view_with(Tool::Brush);
+            view.set_brush(brush);
+            click(&mut view, 100, 100);
+            black_count(&view)
+        };
+        assert_ne!(footprint(0), footprint(DEFAULT_BRUSH));
+
+        // Mirrors paint the brush's reflections around the window's middle.
+        let mut view = view_with(Tool::Brush);
+        view.set_visible(Rect::new(0, 0, 200, 200));
+        view.set_symmetry(rustpaint_engine::symmetry::map_symmetry(
+            true, false, false, false,
+        ));
+        click(&mut view, 50, 100);
+        assert!(view.canvas().get(50, 100) && view.canvas().get(150, 100));
+
+        // The page shift moves everything and can be undone.
+        view.offset_page(8, 0);
+        assert!(view.canvas().get(58, 100) && !view.canvas().get(50, 100));
+        view.undo();
+        assert!(view.canvas().get(50, 100));
+    }
+
+    #[test]
+    fn the_eraser_shrinks_in_fatbits() {
+        let mut view = view_with(Tool::PaintBucket);
+        click(&mut view, 5, 5);
+        view.set_tool(Tool::Eraser);
+        view.set_zoom(8);
+        click(&mut view, 100, 100);
+        assert_eq!(black_count(&view), 576 * 720 - 4);
     }
 }

@@ -2,12 +2,14 @@
 //! does (macOS has the system's): white with a black rule, the open title
 //! inverted, and menus in framed boxes with a drop shadow, the chosen item
 //! inverted and unavailable ones gray. The boxes are 1-bit like the rest
-//! of the window; the text is smooth (see crate::text).
+//! of the window; the text is smooth (see crate::text). A menu too long
+//! for the window, like Font with many families, goes into columns.
 
+use rustpaint_engine::paint_font::{GLYPH_CHECK, paint_font_glyph};
 use rustpaint_engine::{Canvas, Point, Rect};
 
-use crate::art::{draw_palette_box, invert_qd_rect};
-use crate::commands::{Command, MENUS, MenuState};
+use crate::art::{draw_glyph, draw_palette_box, invert_qd_rect};
+use crate::commands::{Command, MenuSpec, MenuState, menus};
 use crate::text::{INTER, TextFont};
 
 pub const HEIGHT: i32 = 20;
@@ -32,10 +34,22 @@ enum Row {
     Separator,
 }
 
+/// Where an open menu goes, and how its rows are arranged.
+struct Placement {
+    /// The box, frame included and shadow not.
+    rect: Rect,
+    column_width: i32,
+    rows_per_column: usize,
+}
+
 pub struct MenuBar {
     font: TextFont,
+    menus: Vec<MenuSpec>,
+    families: Vec<String>,
     /// Each menu's title, where it is in the bar.
     titles: Vec<Rect>,
+    /// The window's height, which long menus wrap to fit.
+    window_height: i32,
     open: Option<usize>,
     highlight: Option<usize>,
     /// The menu stays open after a click on its title, until the next
@@ -43,19 +57,7 @@ pub struct MenuBar {
     sticky: bool,
 }
 
-/// The rows of a menu, separators between its groups.
-fn rows(menu: usize) -> Vec<Row> {
-    let mut rows = Vec::new();
-    for (index, group) in MENUS[menu].groups.iter().enumerate() {
-        if index > 0 {
-            rows.push(Row::Separator);
-        }
-        rows.extend(group.iter().map(|&command| Row::Item(command)));
-    }
-    rows
-}
-
-/// The shortcut as Linux writes it.
+/// The shortcut as Linux and Windows write it.
 fn shortcut_label(command: Command) -> Option<String> {
     command.shortcut().map(|(key, shift)| {
         let key = key.to_ascii_uppercase();
@@ -72,10 +74,12 @@ fn contains(rect: &Rect, point: Point) -> bool {
 }
 
 impl MenuBar {
-    pub fn new() -> Self {
+    /// The menus, with the installed font families in the Font menu.
+    pub fn new(families: Vec<String>) -> Self {
         let font = TextFont::new(INTER, FONT_SIZE);
+        let menus = menus(families.len());
         let mut left = TITLE_START;
-        let titles = MENUS
+        let titles = menus
             .iter()
             .map(|menu| {
                 let width = font.width(menu.title) + 2 * TITLE_PADDING;
@@ -86,15 +90,34 @@ impl MenuBar {
             .collect();
         Self {
             font,
+            menus,
+            families,
             titles,
+            window_height: i32::MAX,
             open: None,
             highlight: None,
             sticky: false,
         }
     }
 
+    pub fn set_window_height(&mut self, height: i32) {
+        self.window_height = height;
+    }
+
     pub fn is_open(&self) -> bool {
         self.open.is_some()
+    }
+
+    /// The rows of a menu, separators between its groups.
+    fn rows(&self, menu: usize) -> Vec<Row> {
+        let mut rows = Vec::new();
+        for (index, group) in self.menus[menu].groups.iter().enumerate() {
+            if index > 0 {
+                rows.push(Row::Separator);
+            }
+            rows.extend(group.iter().map(|&command| Row::Item(command)));
+        }
+        rows
     }
 
     fn title_at(&self, point: Point) -> Option<usize> {
@@ -106,40 +129,67 @@ impl MenuBar {
             .position(|title| point.x >= title.left && point.x < title.right)
     }
 
-    /// The open menu's box, frame included and shadow not.
-    fn menu_rect(&self, menu: usize) -> Rect {
-        let width = rows(menu)
+    fn placement(&self, menu: usize) -> Placement {
+        let rows = self.rows(menu);
+        let column_width = rows
             .iter()
             .map(|row| match row {
                 Row::Item(command) => {
                     let shortcut = shortcut_label(*command)
                         .map_or(0, |label| SHORTCUT_GAP + self.font.width(&label));
-                    TEXT_LEFT + self.font.width(command.label()) + shortcut + TEXT_RIGHT
+                    let label = command.label(&self.families);
+                    TEXT_LEFT + self.font.width(&label) + shortcut + TEXT_RIGHT
                 }
                 Row::Separator => 0,
             })
             .max()
             .unwrap_or(0)
             .max(120);
-        let height = rows(menu).len() as i32 * ROW_HEIGHT + 2;
+        let room = (self.window_height - HEIGHT - 4) / ROW_HEIGHT;
+        let rows_per_column = (room.max(1) as usize).min(rows.len().max(1));
+        let columns = rows.len().div_ceil(rows_per_column).max(1) as i32;
         let left = self.titles[menu].left;
-        Rect::new(left, HEIGHT - 1, left + width, HEIGHT - 1 + height)
+        let top = HEIGHT - 1;
+        Placement {
+            rect: Rect::new(
+                left,
+                top,
+                left + columns * column_width,
+                top + rows_per_column as i32 * ROW_HEIGHT + 2,
+            ),
+            column_width,
+            rows_per_column,
+        }
+    }
+
+    /// Where row `index` of a menu is, inside its box (box coordinates).
+    fn row_rect(placement: &Placement, index: usize) -> Rect {
+        let column = (index / placement.rows_per_column) as i32;
+        let row = (index % placement.rows_per_column) as i32;
+        let left = 1 + column * placement.column_width;
+        let top = 1 + row * ROW_HEIGHT;
+        let right = (left + placement.column_width).min(placement.rect.width() - 1);
+        Rect::new(left, top, right, top + ROW_HEIGHT)
     }
 
     /// The row of the open menu at point.
     fn row_at(&self, point: Point) -> Option<usize> {
         let menu = self.open?;
-        let rect = self.menu_rect(menu);
+        let placement = self.placement(menu);
+        let rect = placement.rect;
         if !contains(&rect.inset_by(1, 1), point) {
             return None;
         }
-        Some(((point.y - rect.top - 1) / ROW_HEIGHT) as usize)
+        let column = ((point.x - rect.left - 1) / placement.column_width) as usize;
+        let row = ((point.y - rect.top - 1) / ROW_HEIGHT) as usize;
+        let index = column * placement.rows_per_column + row;
+        (index < self.rows(menu).len()).then_some(index)
     }
 
     /// The command at point, if it's an item that's available.
     fn item_at(&self, point: Point, state: MenuState) -> Option<(usize, Command)> {
         let row = self.row_at(point)?;
-        match rows(self.open?)[row] {
+        match self.rows(self.open?)[row] {
             Row::Item(command) if command.is_enabled(state) => Some((row, command)),
             _ => None,
         }
@@ -226,23 +276,35 @@ impl MenuBar {
         canvas
     }
 
-    /// The open menu and where it goes, shadow included, without its text.
-    pub fn render_menu(&self) -> Option<(Point, Canvas)> {
+    /// The open menu and where it goes, shadow included, without its text
+    /// but with its check marks (PaintFont's).
+    pub fn render_menu(&self, state: MenuState) -> Option<(Point, Canvas)> {
         let menu = self.open?;
-        let rect = self.menu_rect(menu);
+        let placement = self.placement(menu);
+        let rect = placement.rect;
         let mut canvas = Canvas::new(rect.width() + 1, rect.height() + 1);
         draw_palette_box(&mut canvas);
 
-        for (index, row) in rows(menu).iter().enumerate() {
-            let top = 1 + index as i32 * ROW_HEIGHT;
-            if *row == Row::Separator {
-                // A dotted gray line.
-                let y = top + ROW_HEIGHT / 2;
-                for x in (1..rect.width() - 1).step_by(2) {
-                    canvas.set(x, y, true);
+        for (index, row) in self.rows(menu).iter().enumerate() {
+            let cell = Self::row_rect(&placement, index);
+            match row {
+                Row::Separator => {
+                    // A dotted gray line.
+                    let y = cell.top + ROW_HEIGHT / 2;
+                    for x in (cell.left..cell.right).step_by(2) {
+                        canvas.set(x, y, true);
+                    }
                 }
-            } else if self.highlight == Some(index) {
-                invert_qd_rect(&mut canvas, 1, top, rect.width() - 1, top + ROW_HEIGHT);
+                Row::Item(command) => {
+                    if command.is_checked(state) == Some(true)
+                        && let Some(check) = paint_font_glyph(GLYPH_CHECK)
+                    {
+                        draw_glyph(&mut canvas, check, cell.left + 1, cell.top, false);
+                    }
+                    if self.highlight == Some(index) {
+                        invert_qd_rect(&mut canvas, cell.left, cell.top, cell.right, cell.bottom);
+                    }
+                }
             }
         }
         Some((Point::new(rect.left, rect.top), canvas))
@@ -268,13 +330,20 @@ impl MenuBar {
             } else {
                 BLACK
             };
-            draw(title.left + TITLE_PADDING, 14, MENUS[index].title, color);
+            draw(
+                title.left + TITLE_PADDING,
+                14,
+                self.menus[index].title,
+                color,
+            );
         }
 
         let Some(menu) = self.open else { return };
-        let rect = self.menu_rect(menu);
-        for (index, row) in rows(menu).iter().enumerate() {
+        let placement = self.placement(menu);
+        let origin = Point::new(placement.rect.left, placement.rect.top);
+        for (index, row) in self.rows(menu).iter().enumerate() {
             let Row::Item(command) = row else { continue };
+            let cell = Self::row_rect(&placement, index);
             let color = if self.highlight == Some(index) {
                 WHITE
             } else if command.is_enabled(state) {
@@ -282,11 +351,17 @@ impl MenuBar {
             } else {
                 GRAY
             };
-            let baseline = rect.top + 1 + index as i32 * ROW_HEIGHT + 12;
-            draw(rect.left + TEXT_LEFT, baseline, command.label(), color);
-            if let Some(label) = shortcut_label(*command) {
-                let x = rect.right - TEXT_RIGHT - self.font.width(&label);
-                draw(x, baseline, &label, color);
+            let baseline = origin.y + cell.top + 12;
+            let label = command.label(&self.families);
+            draw(
+                origin.x + cell.left + TEXT_LEFT - 1,
+                baseline,
+                &label,
+                color,
+            );
+            if let Some(shortcut) = shortcut_label(*command) {
+                let x = origin.x + cell.right - TEXT_RIGHT - self.font.width(&shortcut);
+                draw(x, baseline, &shortcut, color);
             }
         }
     }
@@ -300,17 +375,39 @@ mod tests {
         can_undo: true,
         has_selection: true,
         can_revert: true,
+        grid: false,
+        fat_bits: false,
+        mirrors: false,
+        modal: false,
+        text: crate::commands::TextMenuState {
+            font: None,
+            size: None,
+            bold: false,
+            italic: false,
+            underline: false,
+            outline: false,
+            shadow: false,
+            alignment: crate::typesetter::Alignment::Left,
+        },
     };
+
+    fn bar() -> MenuBar {
+        MenuBar::new(vec!["Geneva".into(), "Monaco".into()])
+    }
 
     /// The middle of row `row` of the open menu.
     fn row_point(bar: &MenuBar, row: usize) -> Point {
-        let rect = bar.menu_rect(bar.open.unwrap());
-        Point::new(rect.left + 30, rect.top + 1 + row as i32 * ROW_HEIGHT + 8)
+        let placement = bar.placement(bar.open.unwrap());
+        let cell = MenuBar::row_rect(&placement, row);
+        Point::new(
+            placement.rect.left + cell.left + 30,
+            placement.rect.top + cell.top + 8,
+        )
     }
 
     #[test]
     fn dragging_down_a_menu_chooses_on_release() {
-        let mut bar = MenuBar::new();
+        let mut bar = bar();
         let file = Point::new(bar.titles[0].left + 5, 10);
         assert!(bar.mouse_down(file, ALL) && bar.is_open());
         // File: New, Open, separator, Save, ...
@@ -323,7 +420,7 @@ mod tests {
 
     #[test]
     fn a_click_on_a_title_keeps_the_menu_open() {
-        let mut bar = MenuBar::new();
+        let mut bar = bar();
         let edit = Point::new(bar.titles[1].left + 5, 10);
         bar.mouse_down(edit, ALL);
         assert_eq!(bar.mouse_up(edit, ALL), None);
@@ -343,7 +440,7 @@ mod tests {
 
     #[test]
     fn unavailable_items_and_separators_cant_be_chosen() {
-        let mut bar = MenuBar::new();
+        let mut bar = bar();
         let edit = Point::new(bar.titles[1].left + 5, 10);
         bar.mouse_down(edit, MenuState::default());
         let undo = row_point(&bar, 0);
@@ -357,17 +454,33 @@ mod tests {
     }
 
     #[test]
+    fn the_font_menu_lists_the_families_and_long_menus_wrap() {
+        let mut bar = MenuBar::new((0..40).map(|i| format!("Font {i}")).collect());
+        bar.set_window_height(HEIGHT + 4 + 10 * ROW_HEIGHT);
+        let font = Point::new(bar.titles[3].left + 5, 10);
+        bar.mouse_down(font, ALL);
+        let placement = bar.placement(3);
+        assert_eq!(placement.rows_per_column, 10);
+        assert_eq!(placement.rect.width(), 4 * placement.column_width);
+
+        // The first row of the third column is the 21st family.
+        let point = row_point(&bar, 20);
+        bar.mouse_moved(point, ALL);
+        assert_eq!(bar.mouse_up(point, ALL), Some(Command::Font(20)));
+    }
+
+    #[test]
     fn menus_render_with_their_titles_and_items() {
-        let mut bar = MenuBar::new();
+        let mut bar = bar();
         let canvas = bar.render_bar(300);
         assert!((0..300).all(|x| canvas.get(x, HEIGHT - 1)));
-        assert!(bar.render_menu().is_none());
+        assert!(bar.render_menu(ALL).is_none());
 
         bar.mouse_down(Point::new(bar.titles[0].left + 5, 10), ALL);
         let open = bar.render_bar(300);
         // The open title is inverted.
         assert!(open.get(bar.titles[0].left + 1, 2));
-        let (origin, menu) = bar.render_menu().unwrap();
+        let (origin, menu) = bar.render_menu(ALL).unwrap();
         assert_eq!(origin, Point::new(bar.titles[0].left, HEIGHT - 1));
         assert!(menu.width() > 120 && menu.height() == 9 * ROW_HEIGHT + 3);
     }

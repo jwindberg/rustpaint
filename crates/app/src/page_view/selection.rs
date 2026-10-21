@@ -162,14 +162,21 @@ impl PageView {
         )
     }
 
-    /// Whether there are ants to march.
-    pub fn has_ants(&self) -> bool {
-        self.sel.overlay_ants && !self.sel.overlay.is_empty()
+    /// Whether there are ants to march or a caret to blink, about 25 times
+    /// a second.
+    pub fn needs_ticks(&self) -> bool {
+        (self.sel.overlay_ants && !self.sel.overlay.is_empty()) || self.text_active()
     }
 
-    /// Steps the marching ants.
-    pub fn march_ants(&mut self) {
-        self.sel.ants_phase = (self.sel.ants_phase + 1) & 7;
+    /// Steps the marching ants, or the caret's blink.
+    pub fn tick(&mut self) {
+        if !self.blink_caret() {
+            self.sel.ants_phase = (self.sel.ants_phase + 1) & 7;
+        }
+    }
+
+    pub(super) fn sel_overlay_is_empty(&self) -> bool {
+        self.sel.overlay.is_empty()
     }
 
     /// Whether the pointer shows the arrow at this page point: over a
@@ -257,7 +264,8 @@ impl PageView {
 
     /// AcceptEdits: the canvas already shows the selection where it is, so
     /// accepting only forgets it.
-    pub(super) fn accept_selection(&mut self) {
+    pub fn accept_selection(&mut self) {
+        self.accept_text();
         if self.sel.selection.is_none() {
             return;
         }
@@ -551,7 +559,7 @@ impl PageView {
             .any(|dy| (-1..=1).any(|dx| selection.contains(Point::new(point.x + dx, point.y + dy))))
     }
 
-    fn set_overlay(&mut self, points: Vec<Point>, ants: bool) {
+    pub(super) fn set_overlay(&mut self, points: Vec<Point>, ants: bool) {
         self.sel.overlay = points;
         self.sel.overlay_ants = ants;
     }
@@ -605,7 +613,7 @@ mod tests {
         drag(&mut view, &[(15, 15), (34, 34)], NONE);
         let selection = view.selection().expect("selected");
         assert_eq!(selection.rect, Rect::new(15, 15, 35, 35));
-        assert!(view.has_ants() && view.overlay().0.len() == 4 * 19);
+        assert!(view.needs_ticks() && view.overlay().0.len() == 4 * 19);
         assert!(view.shows_arrow(Point::new(20, 20)) && !view.shows_arrow(Point::new(50, 50)));
 
         drag(&mut view, &[(20, 20), (120, 70)], NONE);
@@ -656,7 +664,7 @@ mod tests {
             view.mouse_moved(Point::new(x, y), NONE);
         }
         // The trail shows while drawing, in black.
-        assert!(!view.has_ants() && view.overlay().0.len() > 100);
+        assert!(!view.needs_ticks() && view.overlay().0.len() > 100);
         view.mouse_up(Point::new(10, 12), NONE);
         let selection = view.selection().expect("selected");
         assert!(selection.lasso && selection.rect == Rect::new(20, 20, 30, 30));

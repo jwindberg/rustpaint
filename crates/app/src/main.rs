@@ -5,6 +5,7 @@
 mod art;
 mod clipboard;
 mod commands;
+mod dialogs;
 mod documents;
 mod images;
 mod menu_bar;
@@ -14,6 +15,7 @@ mod page_view;
 mod palettes;
 mod text;
 mod tool;
+mod typesetter;
 
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -21,12 +23,14 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use rustpaint_engine::geometry::AxisLock;
 use rustpaint_engine::paint_font::{
-    DEFAULT_BRUSH, GLYPH_ALL_ONES, GLYPH_ERASER_BOX, GLYPH_FILL_MASK, GLYPH_FIRST_BRUSH,
+    BRUSH_COUNT, GLYPH_ALL_ONES, GLYPH_ERASER_BOX, GLYPH_FILL_MASK, GLYPH_FIRST_BRUSH,
     GLYPH_LINE_CURSOR_1, GLYPH_LINE_CURSOR_2, GLYPH_LINE_CURSOR_4, GLYPH_LINE_CURSOR_8,
     GLYPH_PENCIL_MASK, GLYPH_SPRAY,
 };
 use rustpaint_engine::patterns::{DEFAULT_PATTERN_INDEX, PATTERN_COUNT, PATTERNS};
+use rustpaint_engine::symmetry::map_symmetry;
 use rustpaint_engine::{Canvas, Pattern, Point, Rect};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
@@ -38,11 +42,16 @@ use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::art::CURSOR_SIZE;
 use crate::clipboard::Clipboard;
-use crate::commands::{Command, MenuState};
+use crate::commands::{Command, Face, MenuState, TextMenuState};
+use crate::dialogs::{
+    Dialog, MIRROR_ANTI_DIAGONAL, MIRROR_DIAGONAL, MIRROR_HORIZONTAL, MIRROR_VERTICAL, Outcome,
+};
 use crate::documents::{MACPAINT_EXTENSIONS, export_png, load_document, save_macpaint};
-use crate::page_view::{Modifiers, PageView, SelectionCommand, ant_bit};
+use crate::page_view::{Modifiers, PageView, SelectionCommand, TextKey, ant_bit};
 use crate::palettes::{line_widths, patterns, tools};
+use crate::text::TextFont;
 use crate::tool::Tool;
+use crate::typesetter::{FONT_SIZES, TextStyle, Typesetter};
 
 /// Space around and between the palettes and the page.
 const MARGIN: i32 = 6;
@@ -66,6 +75,8 @@ const LINE_SCROLL: f64 = 16.0;
 const ANTS_INTERVAL: Duration = Duration::from_millis(40);
 
 const UNTITLED: &str = "untitled";
+/// FatBits: MacPaint's 8x magnification.
+const FAT_ZOOM: i32 = 8;
 
 /// Events from outside the window.
 #[derive(Debug)]
@@ -120,22 +131,31 @@ impl Layout {
 enum CursorKind {
     Arrow,
     Tool(Tool),
+    /// The brush cursor, one per brush shape.
+    Brush(i32),
     /// The line and shape tools' crosshair, one per line size.
     Line(usize),
 }
 
 /// What a press is dragging, until the button comes up.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 enum Capture {
     None,
     Page,
     Menu,
+    Dialog,
+    /// The grabber, from where the drag started and the scroll then.
+    Grab {
+        start: Point,
+        scroll: (f64, f64),
+    },
 }
 
 /// Something that reacts to a double-click.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClickTarget {
     Tool(Tool),
+    Pattern(usize),
 }
 
 struct Graphics {
@@ -159,9 +179,23 @@ struct App {
     /// Logical pixels per physical pixel's worth: a whole number.
     scale: u32,
     layout: Layout,
-    /// The page position at the top left of the view, kept fractional so
-    /// trackpads scroll smoothly.
+    /// The view position at the top left of the page view, in view pixels
+    /// (page pixels times zoom), kept fractional so trackpads scroll
+    /// smoothly.
     scroll: (f64, f64),
+    /// 1, or 8 in FatBits.
+    zoom: i32,
+    grid: bool,
+    /// Brush Mirrors' `dialogs::MIRROR_*` flags.
+    mirrors: u8,
+    /// The Goodies dialog that's open, if one is.
+    dialog: Option<Dialog>,
+    /// For dialog buttons.
+    ui_font: TextFont,
+    /// The installed fonts, for the text tool, and its style.
+    typesetter: Rc<Typesetter>,
+    text_style: TextStyle,
+    grab_lock: AxisLock,
     mouse: Point,
     modifiers: ModifiersState,
     capture: Capture,
@@ -184,7 +218,11 @@ struct App {
 
 impl App {
     fn new() -> Self {
-        let view = PageView::new();
+        let typesetter = Rc::new(Typesetter::system());
+        let text_style = typesetter.default_style();
+        let mut view = PageView::new();
+        view.set_typesetter(typesetter.clone(), text_style.clone());
+        let families = typesetter.families().to_vec();
         let pattern_index = DEFAULT_PATTERN_INDEX;
         Self {
             tool_palette: tools::render(view.tool()),
@@ -197,13 +235,21 @@ impl App {
             scale: 1,
             layout: Layout::new(0, 0),
             scroll: (0.0, 0.0),
+            zoom: 1,
+            grid: false,
+            mirrors: 0,
+            dialog: None,
+            ui_font: TextFont::new(text::INTER, 13.0),
+            typesetter,
+            text_style,
+            grab_lock: AxisLock::default(),
             mouse: Point::default(),
             modifiers: ModifiersState::empty(),
             capture: Capture::None,
             last_click: None,
             next_ants: Instant::now(),
             clipboard: Clipboard::new(),
-            menu_bar: DRAWN_MENUS.then(menu_bar::MenuBar::new),
+            menu_bar: DRAWN_MENUS.then(|| menu_bar::MenuBar::new(families)),
             #[cfg(target_os = "macos")]
             menus: None,
             path: None,
@@ -234,35 +280,127 @@ impl App {
         Point::new(self.scroll.0 as i32, self.scroll.1 as i32)
     }
 
-    /// Keeps the page in view.
+    /// Keeps the page in view, and tells the page view what it shows.
     fn clamp_scroll(&mut self) {
         let page = self.view.canvas();
-        let max_x = (page.width() - self.layout.page.width()).max(0) as f64;
-        let max_y = (page.height() - self.layout.page.height()).max(0) as f64;
+        let max_x = (page.width() * self.zoom - self.layout.page.width()).max(0) as f64;
+        let max_y = (page.height() * self.zoom - self.layout.page.height()).max(0) as f64;
         self.scroll = (
             self.scroll.0.clamp(0.0, max_x),
             self.scroll.1.clamp(0.0, max_y),
         );
-
-        // Brush Mirrors reflect around the middle of what's visible.
-        let origin = self.scroll_origin();
-        let (page, view) = (self.view.canvas(), &self.layout.page);
-        let visible = Rect::new(
-            origin.x,
-            origin.y,
-            (origin.x + view.width()).min(page.width()),
-            (origin.y + view.height()).min(page.height()),
-        );
+        let visible = self.visible_rect();
         self.view.set_visible(visible);
+    }
+
+    /// The part of the page in the window, in page pixels.
+    fn visible_rect(&self) -> Rect {
+        let origin = self.scroll_origin();
+        let (page, view, zoom) = (self.view.canvas(), &self.layout.page, self.zoom);
+        Rect::new(
+            origin.x / zoom,
+            origin.y / zoom,
+            ((origin.x + view.width() + zoom - 1) / zoom).min(page.width()),
+            ((origin.y + view.height() + zoom - 1) / zoom).min(page.height()),
+        )
     }
 
     /// The page point under a window point.
     fn page_point(&self, point: Point) -> Point {
         let origin = self.scroll_origin();
         Point::new(
-            point.x - self.layout.page.left + origin.x,
-            point.y - self.layout.page.top + origin.y,
+            (point.x - self.layout.page.left + origin.x).div_euclid(self.zoom),
+            (point.y - self.layout.page.top + origin.y).div_euclid(self.zoom),
         )
+    }
+
+    /// Scrolls so the page point is at the view's top left.
+    fn scroll_to_page(&mut self, origin: Point) {
+        self.scroll = ((origin.x * self.zoom) as f64, (origin.y * self.zoom) as f64);
+        self.clamp_scroll();
+    }
+
+    /// Goodies > FatBits: 8x magnification, every tool still works.
+    fn set_fat_bits(&mut self, fat_bits: bool) {
+        if fat_bits == (self.zoom > 1) {
+            return;
+        }
+        // MacPaint centers on the selection if there is one.
+        let around = self
+            .view
+            .selection()
+            .map_or(self.visible_rect(), |s| s.rect);
+        let center = Point::new(
+            (around.left + around.right) / 2,
+            (around.top + around.bottom) / 2,
+        );
+        self.view.finish_editing();
+
+        self.zoom = if fat_bits { FAT_ZOOM } else { 1 };
+        self.view.set_zoom(self.zoom);
+        let view = self.layout.page;
+        self.scroll = (
+            (center.x * self.zoom - view.width() / 2) as f64,
+            (center.y * self.zoom - view.height() / 2) as f64,
+        );
+        self.clamp_scroll();
+    }
+
+    fn set_grid(&mut self, grid: bool) {
+        self.grid = grid;
+        self.view.set_grid(grid);
+    }
+
+    fn set_mirrors(&mut self, mirrors: u8) {
+        self.mirrors = mirrors;
+        self.view.set_symmetry(map_symmetry(
+            mirrors & MIRROR_VERTICAL != 0,
+            mirrors & MIRROR_HORIZONTAL != 0,
+            mirrors & MIRROR_DIAGONAL != 0,
+            mirrors & MIRROR_ANTI_DIAGONAL != 0,
+        ));
+    }
+
+    fn show_dialog(&mut self, dialog: Dialog) {
+        self.view.finish_editing();
+        self.dialog = Some(dialog);
+    }
+
+    /// Where the open dialog is: in the middle of the window.
+    fn dialog_origin(&self) -> Point {
+        let (Some(dialog), Some(window)) = (&self.dialog, self.window()) else {
+            return Point::default();
+        };
+        let size = window.inner_size();
+        let (width, height) = dialog.size();
+        let scale = self.scale as i32;
+        Point::new(
+            ((size.width as i32 / scale - width) / 2).max(0),
+            ((size.height as i32 / scale - height) / 2).max(0),
+        )
+    }
+
+    /// Acts on what a dialog decided.
+    fn dialog_done(&mut self, outcome: Outcome) {
+        match outcome {
+            Outcome::Open => return,
+            Outcome::Cancelled => {}
+            Outcome::Pattern(pattern) => {
+                let mut patterns = self.patterns;
+                patterns[self.pattern_index] = pattern;
+                self.set_patterns(patterns);
+                // The patterns are saved with the document.
+                self.view.set_dirty(true);
+            }
+            Outcome::Brush(brush) => self.view.set_brush(brush),
+            Outcome::Mirrors(mirrors) => self.set_mirrors(mirrors),
+            Outcome::ShowPage { shift, origin } => {
+                self.view.offset_page(shift.x, shift.y);
+                self.scroll_to_page(origin);
+            }
+        }
+        self.dialog = None;
+        self.capture = Capture::None;
     }
 
     fn in_page_view(&self, point: Point) -> bool {
@@ -276,10 +414,14 @@ impl App {
         };
         let size = graphics.window.inner_size();
         self.scale = (graphics.window.scale_factor().round() as u32).max(1);
-        self.layout = Layout::new(
+        let (width, height) = (
             (size.width / self.scale) as i32,
             (size.height / self.scale) as i32,
         );
+        self.layout = Layout::new(width, height);
+        if let Some(bar) = &mut self.menu_bar {
+            bar.set_window_height(height);
+        }
         self.clamp_scroll();
     }
 
@@ -310,6 +452,17 @@ impl App {
 
     fn mouse_down(&mut self) {
         let point = self.mouse;
+        // A dialog is modal: it takes every press.
+        if self.dialog.is_some() {
+            let origin = self.dialog_origin();
+            let local = Point::new(point.x - origin.x, point.y - origin.y);
+            if let Some(dialog) = &mut self.dialog {
+                let outcome = dialog.mouse_down(local);
+                self.capture = Capture::Dialog;
+                self.dialog_done(outcome);
+            }
+            return;
+        }
         let state = self.menu_state();
         if let Some(bar) = &mut self.menu_bar
             && bar.mouse_down(point, state)
@@ -328,9 +481,17 @@ impl App {
                 return;
             }
             self.set_tool(tool);
-            // Double-clicking the marquee selects the whole window.
-            if double && tool == Tool::Select {
-                self.view.select_all();
+            // Double-clicks, as in MacPaint: the marquee selects the whole
+            // window, the pencil toggles FatBits, the brush opens Brush
+            // Shape and the grabber Show Page.
+            if double {
+                match tool {
+                    Tool::Select => self.view.select_all(),
+                    Tool::Pencil => self.set_fat_bits(self.zoom == 1),
+                    Tool::Brush => self.run(Command::BrushShape),
+                    Tool::Grabber => self.run(Command::ShowPage),
+                    _ => {}
+                }
             }
             return;
         }
@@ -344,6 +505,19 @@ impl App {
         let (x, y) = at(self.layout.patterns);
         if let Some(index) = patterns::hit(x, y) {
             self.set_pattern(index);
+            // Double-clicking a pattern edits it.
+            if self.is_double_click(ClickTarget::Pattern(index)) {
+                self.run(Command::EditPattern);
+            }
+            return;
+        }
+        if self.in_page_view(point) && self.view.tool() == Tool::Grabber {
+            // ScrollDoc: drag the page around in the window.
+            self.capture = Capture::Grab {
+                start: point,
+                scroll: self.scroll,
+            };
+            self.grab_lock = AxisLock::new(point);
             return;
         }
         if self.in_page_view(point) {
@@ -354,6 +528,15 @@ impl App {
     }
 
     fn key_down(&mut self, key: &Key) {
+        if let Some(dialog) = &mut self.dialog {
+            let outcome = match key {
+                Key::Named(NamedKey::Escape) => dialog.key(true),
+                Key::Named(NamedKey::Enter) => dialog.key(false),
+                _ => Outcome::Open,
+            };
+            self.dialog_done(outcome);
+            return;
+        }
         // Menu shortcuts: Command on macOS, where the menus mostly take them
         // before the window sees them, and Ctrl elsewhere.
         let state = self.modifiers;
@@ -370,6 +553,22 @@ impl App {
                     .and_then(|key| Command::from_shortcut(key, state.shift_key()))
             {
                 self.run(command);
+            }
+            return;
+        }
+        // Text being typed: Return starts a new line, and Escape takes the
+        // place of MacPaint's Enter, which accepted.
+        if self.view.text_active() {
+            let text_key = match key {
+                Key::Named(NamedKey::Enter) => Some(TextKey::NewLine),
+                Key::Named(NamedKey::Backspace) => Some(TextKey::Backspace),
+                Key::Named(NamedKey::Escape) => Some(TextKey::Done),
+                Key::Named(NamedKey::Space) => Some(TextKey::Text(" ".into())),
+                Key::Character(text) => Some(TextKey::Text(text.to_string())),
+                _ => None,
+            };
+            if let Some(text_key) = text_key {
+                self.view.type_text(text_key);
             }
             return;
         }
@@ -424,6 +623,22 @@ impl App {
             }
             Command::Clear => self.view.clear(),
             Command::SelectAll => self.view.select_all(),
+            Command::Grid => self.set_grid(!self.grid),
+            Command::FatBits => self.set_fat_bits(self.zoom == 1),
+            Command::ShowPage => {
+                // As in MacPaint, Show Page leaves FatBits.
+                self.set_fat_bits(false);
+                let dialog = Dialog::show_page(self.view.canvas(), self.visible_rect());
+                self.show_dialog(dialog);
+            }
+            Command::EditPattern => {
+                self.show_dialog(Dialog::edit_pattern(self.patterns[self.pattern_index]))
+            }
+            Command::BrushShape => self.show_dialog(Dialog::brush_shape(self.view.brush())),
+            Command::BrushMirrors => self.show_dialog(Dialog::mirrors(self.mirrors)),
+            Command::Font(_) | Command::FontSize(_) | Command::Face(_) | Command::Align(_) => {
+                self.change_text_style(command)
+            }
             _ => {
                 if let Some(mut operation) = selection_command(command) {
                     // As in MacPaint, Shift makes Trace Edges add a shadow.
@@ -437,11 +652,62 @@ impl App {
         self.request_redraw();
     }
 
+    fn text_menu_state(&self) -> TextMenuState {
+        let style = &self.text_style;
+        TextMenuState {
+            font: self
+                .typesetter
+                .families()
+                .iter()
+                .position(|f| *f == style.family),
+            size: FONT_SIZES.iter().position(|&size| size == style.size),
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+            outline: style.outline,
+            shadow: style.shadow,
+            alignment: style.alignment,
+        }
+    }
+
+    /// The Font, FontSize and Style menus.
+    fn change_text_style(&mut self, command: Command) {
+        let style = &mut self.text_style;
+        match command {
+            Command::Font(index) => {
+                if let Some(family) = self.typesetter.families().get(index) {
+                    style.family = family.clone();
+                }
+            }
+            Command::FontSize(index) => style.size = FONT_SIZES[index],
+            Command::Face(Face::Plain) => {
+                style.bold = false;
+                style.italic = false;
+                style.underline = false;
+                style.outline = false;
+                style.shadow = false;
+            }
+            Command::Face(Face::Bold) => style.bold = !style.bold,
+            Command::Face(Face::Italic) => style.italic = !style.italic,
+            Command::Face(Face::Underline) => style.underline = !style.underline,
+            Command::Face(Face::Outline) => style.outline = !style.outline,
+            Command::Face(Face::Shadow) => style.shadow = !style.shadow,
+            Command::Align(alignment) => style.alignment = alignment,
+            _ => return,
+        }
+        self.view.set_text_style(self.text_style.clone());
+    }
+
     fn menu_state(&self) -> MenuState {
         MenuState {
             can_undo: self.view.can_undo(),
             has_selection: self.view.has_selection(),
             can_revert: self.path.is_some() && self.view.is_dirty(),
+            grid: self.grid,
+            fat_bits: self.zoom > 1,
+            mirrors: self.mirrors != 0,
+            modal: self.dialog.is_some(),
+            text: self.text_menu_state(),
         }
     }
 
@@ -649,13 +915,17 @@ impl App {
                     self.run(command);
                 }
             }
-            Capture::None => {}
+            Capture::Dialog => {
+                let outcome = self.dialog.as_mut().map_or(Outcome::Open, |d| d.mouse_up());
+                self.dialog_done(outcome);
+            }
+            Capture::None | Capture::Grab { .. } => {}
         }
         self.capture = Capture::None;
     }
 
     fn cursor_kind(&self) -> CursorKind {
-        if self.menu_bar.as_ref().is_some_and(|bar| bar.is_open()) {
+        if self.dialog.is_some() || self.menu_bar.as_ref().is_some_and(|bar| bar.is_open()) {
             return CursorKind::Arrow;
         }
         if self.capture != Capture::Page && !self.in_page_view(self.mouse) {
@@ -685,6 +955,7 @@ impl App {
                     _ => 0,
                 })
             }
+            Tool::Brush => CursorKind::Brush(self.view.brush()),
             tool => CursorKind::Tool(tool),
         }
     }
@@ -715,39 +986,7 @@ impl App {
             blit(frame, width, height, canvas, origin, true);
         }
 
-        let view = &self.layout.page;
-        let page = self.view.canvas();
-        let origin = self.scroll_origin();
-        for y in view.top.max(0)..view.bottom.min(height) {
-            for x in view.left.max(0)..view.right.min(width) {
-                let (px, py) = (x - view.left + origin.x, y - view.top + origin.y);
-                frame[(y * width + x) as usize] = if !page.contains(px, py) {
-                    OUTSIDE_PAGE_COLOR
-                } else if page.get(px, py) {
-                    BLACK
-                } else {
-                    WHITE
-                };
-            }
-        }
-
-        // The overlay goes on top, on screen only.
-        let (overlay, ants, phase) = self.view.overlay();
-        for point in overlay {
-            let (x, y) = (
-                point.x - origin.x + view.left,
-                point.y - origin.y + view.top,
-            );
-            if page.contains(point.x, point.y)
-                && x >= view.left.max(0)
-                && x < view.right.min(width)
-                && y >= view.top.max(0)
-                && y < view.bottom.min(height)
-            {
-                let black = !ants || ant_bit(point.x, point.y, phase);
-                frame[(y * width + x) as usize] = if black { BLACK } else { WHITE };
-            }
-        }
+        self.render_page(frame, width, height);
 
         // The menus go over everything.
         if let Some(bar) = &self.menu_bar {
@@ -759,15 +998,89 @@ impl App {
                 Point::default(),
                 false,
             );
-            if let Some((origin, menu)) = bar.render_menu() {
+            if let Some((origin, menu)) = bar.render_menu(self.menu_state()) {
                 blit(frame, width, height, &menu, origin, true);
             }
+        }
+        if let Some(dialog) = &self.dialog {
+            blit(
+                frame,
+                width,
+                height,
+                &dialog.render(),
+                self.dialog_origin(),
+                false,
+            );
+        }
+    }
+
+    /// The page in its view: actual size, or in FatBits each page pixel
+    /// 7 x 7 with a white line between (MacPaint's FatToScrn) and a small
+    /// actual size view in the corner.
+    fn render_page(&self, frame: &mut [u32], width: i32, height: i32) {
+        let view = &self.layout.page;
+        let page = self.view.canvas();
+        let origin = self.scroll_origin();
+        let zoom = self.zoom;
+        let clip = Rect::new(
+            view.left.max(0),
+            view.top.max(0),
+            view.right.min(width),
+            view.bottom.min(height),
+        );
+        for y in clip.top..clip.bottom {
+            let vy = y - view.top + origin.y;
+            for x in clip.left..clip.right {
+                let vx = x - view.left + origin.x;
+                let (px, py) = (vx.div_euclid(zoom), vy.div_euclid(zoom));
+                let between = zoom > 1 && (vx % zoom == zoom - 1 || vy % zoom == zoom - 1);
+                frame[(y * width + x) as usize] = if !page.contains(px, py) {
+                    OUTSIDE_PAGE_COLOR
+                } else if !between && page.get(px, py) {
+                    BLACK
+                } else {
+                    WHITE
+                };
+            }
+        }
+
+        // The overlay goes on top, on screen only.
+        let (overlay, ants, phase) = self.view.overlay();
+        let cell = if zoom > 1 { zoom - 1 } else { 1 };
+        for point in overlay {
+            if !page.contains(point.x, point.y) {
+                continue;
+            }
+            let black = !ants || ant_bit(point.x, point.y, phase);
+            let left = view.left + point.x * zoom - origin.x;
+            let top = view.top + point.y * zoom - origin.y;
+            for y in top.max(clip.top)..(top + cell).min(clip.bottom) {
+                for x in left.max(clip.left)..(left + cell).min(clip.right) {
+                    frame[(y * width + x) as usize] = if black { BLACK } else { WHITE };
+                }
+            }
+        }
+
+        if zoom > 1 {
+            // MacPaint's little actual size view, in the view's top left.
+            let visible = self.visible_rect();
+            let (left, top) = (view.left + 8, view.top + 8);
+            let (preview_width, preview_height) = (visible.width() + 2, visible.height() + 2);
+            let mut preview = Canvas::new(preview_width, preview_height);
+            art::frame_qd_rect(&mut preview, 0, 0, preview_width, preview_height);
+            for y in 0..visible.height() {
+                for x in 0..visible.width() {
+                    preview.set(x + 1, y + 1, page.get(visible.left + x, visible.top + y));
+                }
+            }
+            blit(frame, width, height, &preview, Point::new(left, top), false);
         }
     }
 
     fn redraw(&mut self) {
         let scale = self.scale as usize;
         let menu_state = self.menu_state();
+        let dialog_origin = self.dialog_origin();
         let mut logical = Vec::new();
         let Some(graphics) = &mut self.graphics else {
             return;
@@ -809,7 +1122,17 @@ impl App {
             }
         }
 
-        // The menus' text goes on at full resolution.
+        // Text goes on at full resolution.
+        if let Some(dialog) = &self.dialog {
+            dialog.draw_text(
+                &self.ui_font,
+                &mut buffer,
+                physical_width,
+                physical_height,
+                self.scale,
+                dialog_origin,
+            );
+        }
         if let Some(bar) = &self.menu_bar {
             bar.draw_text(
                 &mut buffer,
@@ -859,13 +1182,6 @@ impl App {
                 8,
             ),
             (CursorKind::Tool(Tool::Spray), GLYPH_SPRAY, 0, 8, 8),
-            (
-                CursorKind::Tool(Tool::Brush),
-                GLYPH_FIRST_BRUSH + DEFAULT_BRUSH,
-                0,
-                8,
-                8,
-            ),
             (CursorKind::Tool(Tool::Lasso), 'E' as i32, 0, 2, 15),
             (CursorKind::Tool(Tool::Select), 'r' as i32, 's' as i32, 8, 8),
             (
@@ -883,6 +1199,9 @@ impl App {
             GLYPH_LINE_CURSOR_4,
             GLYPH_LINE_CURSOR_8,
         ];
+        for brush in 0..BRUSH_COUNT {
+            specs.push((CursorKind::Brush(brush), GLYPH_FIRST_BRUSH + brush, 0, 8, 8));
+        }
         for (index, glyph) in line_glyphs.into_iter().enumerate() {
             specs.push((CursorKind::Line(index), glyph, 0, 8, 8));
         }
@@ -937,7 +1256,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         #[cfg(target_os = "macos")]
         {
-            let menus = menus::MenuBar::new();
+            let menus = menus::MenuBar::new(self.typesetter.families());
             menus.install();
             self.menus = Some(menus);
         }
@@ -975,8 +1294,35 @@ impl ApplicationHandler<UserEvent> for App {
                     (position.x / scale).floor() as i32,
                     (position.y / scale).floor() as i32,
                 );
-                // A polygon's next edge follows the pointer with the button
-                // up.
+                if self.capture == Capture::Dialog {
+                    let origin = self.dialog_origin();
+                    let local = Point::new(self.mouse.x - origin.x, self.mouse.y - origin.y);
+                    let shift = self.modifiers().shift;
+                    if let Some(dialog) = &mut self.dialog {
+                        dialog.mouse_moved(local, shift);
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                if let Capture::Grab { start, scroll } = self.capture {
+                    let mut moved = self.mouse;
+                    if self.modifiers().shift {
+                        moved = self.grab_lock.apply(moved);
+                    }
+                    // ScrollFat moves a third of a fat pixel per pixel.
+                    let factor = if self.zoom > 1 {
+                        self.zoom as f64 / 3.0
+                    } else {
+                        1.0
+                    };
+                    self.scroll = (
+                        (scroll.0 - (moved.x - start.x) as f64 * factor).round(),
+                        (scroll.1 - (moved.y - start.y) as f64 * factor).round(),
+                    );
+                    self.clamp_scroll();
+                    self.request_redraw();
+                    return;
+                }
                 if let Some(bar) = &mut self.menu_bar
                     && bar.is_open()
                 {
@@ -988,6 +1334,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.request_redraw();
                     return;
                 }
+                // A polygon's next edge follows the pointer with the button
+                // up.
                 changed = self.capture == Capture::Page || self.view.polygon_active();
                 if changed {
                     self.view
@@ -1062,13 +1410,13 @@ impl ApplicationHandler<UserEvent> for App {
         }
 
         // March the ants while there are any.
-        if !self.view.has_ants() {
+        if !self.view.needs_ticks() {
             event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
         let now = Instant::now();
         if now >= self.next_ants {
-            self.view.march_ants();
+            self.view.tick();
             self.request_redraw();
             self.next_ants = now + ANTS_INTERVAL;
         }

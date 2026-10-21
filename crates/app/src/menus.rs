@@ -2,17 +2,40 @@
 //! window (see crate::menu_bar).
 
 use muda::accelerator::{Accelerator, Code, Modifiers};
-use muda::{Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{CheckMenuItem, IsMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 
-use crate::commands::{Command, MENUS, MenuState};
+use crate::commands::{Command, MenuState, menus};
+
+/// An item, plain or with a check mark.
+enum Item {
+    Plain(MenuItem),
+    Check(CheckMenuItem),
+}
+
+impl Item {
+    fn as_menu_item(&self) -> &dyn IsMenuItem {
+        match self {
+            Item::Plain(item) => item,
+            Item::Check(item) => item,
+        }
+    }
+
+    fn id(&self) -> &MenuId {
+        match self {
+            Item::Plain(item) => item.id(),
+            Item::Check(item) => item.id(),
+        }
+    }
+}
 
 pub struct MenuBar {
     menu: Menu,
-    items: Vec<(Command, MenuItem)>,
+    items: Vec<(Command, Item)>,
 }
 
 impl MenuBar {
-    pub fn new() -> Self {
+    /// The menus, with the installed font families in the Font menu.
+    pub fn new(families: &[String]) -> Self {
         let menu = Menu::new();
         let mut items = Vec::new();
 
@@ -24,7 +47,7 @@ impl MenuBar {
                 name: Some("RustPaint".into()),
                 ..Default::default()
             };
-            let quit = new_item(Command::Quit);
+            let quit = new_item(Command::Quit, families);
             let _ = app_menu.append_items(&[
                 &PredefinedMenuItem::about(None, Some(about)),
                 &PredefinedMenuItem::separator(),
@@ -34,16 +57,16 @@ impl MenuBar {
                 &PredefinedMenuItem::hide_others(None),
                 &PredefinedMenuItem::show_all(None),
                 &PredefinedMenuItem::separator(),
-                &quit,
+                quit.as_menu_item(),
             ]);
             let _ = menu.append(&app_menu);
             items.push((Command::Quit, quit));
         }
 
-        for spec in MENUS {
+        for spec in menus(families.len()) {
             let submenu = Submenu::new(spec.title, true);
             let mut first = true;
-            for group in spec.groups {
+            for group in &spec.groups {
                 // Quit lives in the application menu on macOS.
                 let commands: Vec<Command> = group
                     .iter()
@@ -58,8 +81,8 @@ impl MenuBar {
                 }
                 first = false;
                 for command in commands {
-                    let item = new_item(command);
-                    let _ = submenu.append(&item);
+                    let item = new_item(command, families);
+                    let _ = submenu.append(item.as_menu_item());
                     items.push((command, item));
                 }
             }
@@ -84,12 +107,19 @@ impl MenuBar {
 
     pub fn update(&self, state: MenuState) {
         for (command, item) in &self.items {
-            item.set_enabled(command.is_enabled(state));
+            let enabled = command.is_enabled(state);
+            match item {
+                Item::Plain(item) => item.set_enabled(enabled),
+                Item::Check(item) => {
+                    item.set_enabled(enabled);
+                    item.set_checked(command.is_checked(state) == Some(true));
+                }
+            }
         }
     }
 }
 
-fn new_item(command: Command) -> MenuItem {
+fn new_item(command: Command, families: &[String]) -> Item {
     let modifier = Modifiers::META;
     let accelerator = command.shortcut().and_then(|(key, shift)| {
         let modifiers = if shift {
@@ -99,12 +129,23 @@ fn new_item(command: Command) -> MenuItem {
         };
         key_code(key).map(|code| Accelerator::new(modifiers, code))
     });
-    MenuItem::with_id(
-        MenuId::new(format!("{command:?}")),
-        command.label(),
-        true,
-        accelerator,
-    )
+    let id = MenuId::new(format!("{command:?}"));
+    if command.is_checked(MenuState::default()).is_some() {
+        Item::Check(CheckMenuItem::with_id(
+            id,
+            command.label(families),
+            true,
+            false,
+            accelerator,
+        ))
+    } else {
+        Item::Plain(MenuItem::with_id(
+            id,
+            command.label(families),
+            true,
+            accelerator,
+        ))
+    }
 }
 
 fn key_code(key: char) -> Option<Code> {
