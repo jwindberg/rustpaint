@@ -60,6 +60,10 @@ impl Tool {
         (Tool::Rect as usize..=Tool::FilledOval as usize).contains(&(self as usize))
     }
 
+    pub fn is_selection(self) -> bool {
+        matches!(self, Tool::Lasso | Tool::Select)
+    }
+
     pub fn is_polygon(self) -> bool {
         matches!(self, Tool::Polygon | Tool::FilledPolygon)
     }

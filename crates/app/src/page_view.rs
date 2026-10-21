@@ -14,6 +14,11 @@ use rustpaint_engine::{
 use crate::art::mask_from_glyph;
 use crate::tool::Tool;
 
+mod selection;
+
+use selection::{Drag, SelectionState};
+pub use selection::{SelectionCommand, ant_bit};
+
 /// MacPaint's eraser is its 16 x 16 cursor box, centered on the hotspot.
 const ERASER_SIZE: i32 = 16;
 
@@ -60,6 +65,10 @@ pub struct PageView {
     /// Freeform and polygon vertices, in mouse coordinates.
     points: Vec<Point>,
     polygon_active: bool,
+
+    /// The selection, if there is one, and the overlays drawn over the
+    /// page but not into it: marching ants and the lasso's trail.
+    sel: SelectionState,
 }
 
 impl PageView {
@@ -87,6 +96,7 @@ impl PageView {
             preview_rect: Rect::default(),
             points: Vec::new(),
             polygon_active: false,
+            sel: SelectionState::default(),
         }
     }
 
@@ -102,6 +112,7 @@ impl PageView {
         if self.polygon_active {
             self.finish_polygon(false);
         }
+        self.accept_selection();
         self.tool = tool;
     }
 
@@ -132,10 +143,18 @@ impl PageView {
         self.polygon_active
     }
 
-    /// Clears the whole page, as double-clicking the eraser does.
+    pub fn can_undo(&self) -> bool {
+        self.can_undo
+    }
+
+    /// Clears the selection if there is one, else the whole page.
     pub fn clear(&mut self) {
         if self.polygon_active {
             self.finish_polygon(false);
+        }
+        if self.has_selection() {
+            self.clear_selection();
+            return;
         }
         self.begin_operation();
         self.canvas.clear();
@@ -146,6 +165,7 @@ impl PageView {
         if self.polygon_active {
             self.finish_polygon(false);
         }
+        self.accept_selection();
         if !self.can_undo {
             return;
         }
@@ -153,28 +173,35 @@ impl PageView {
         self.canvas.set_paint_mode(PaintMode::Copy);
     }
 
-    /// A key went down. Returns whether the page used it.
-    pub fn key_down(&mut self) -> bool {
+    /// A key went down; delete is Backspace or Delete. Returns whether the
+    /// page used it.
+    pub fn key_down(&mut self, delete: bool) -> bool {
         // As in MacPaint, any key ends a polygon in progress.
         if self.polygon_active {
             self.finish_polygon(false);
             return true;
         }
+        // Backspace clears the selection, as in MacPaint.
+        if delete && self.has_selection() {
+            self.clear_selection();
+            return true;
+        }
         false
     }
 
-    pub fn mouse_down(&mut self, point: Point, modifiers: Modifiers) {
-        // The selection tools, the grabber and text arrive in later
-        // milestones.
-        if matches!(
-            self.tool,
-            Tool::Lasso | Tool::Select | Tool::Grabber | Tool::Text
-        ) {
+    pub fn mouse_down(&mut self, unsnapped: Point, modifiers: Modifiers) {
+        // The grabber and text arrive in later milestones.
+        if matches!(self.tool, Tool::Grabber | Tool::Text) {
             return;
         }
 
-        let point = self.tool_point(point);
+        let point = self.tool_point(unsnapped);
         self.tracking = true;
+
+        if self.tool.is_selection() {
+            self.selection_mouse_down(point, unsnapped, modifiers);
+            return;
+        }
 
         // A polygon spans several clicks; vertices are added on mouse up.
         if self.tool.is_polygon() {
@@ -249,6 +276,16 @@ impl PageView {
         }
 
         if !self.tracking {
+            return;
+        }
+
+        if self.tool.is_selection() {
+            match self.sel.drag {
+                Drag::Marquee => self.drag_marquee(point),
+                Drag::Lasso => self.drag_lasso(point),
+                Drag::None => {}
+                _ => self.drag_selection(point, modifiers),
+            }
             return;
         }
 
@@ -327,7 +364,9 @@ impl PageView {
         }
         self.tracking = false;
 
-        if self.tool == Tool::FilledFreeform {
+        if self.tool.is_selection() {
+            self.end_selection_drag(point);
+        } else if self.tool == Tool::FilledFreeform {
             self.finish_filled_freeform(modifiers);
         } else if self.tool == Tool::Line || self.tool.is_shape() {
             self.drag_to(point, modifiers);
@@ -752,7 +791,7 @@ mod tests {
         click(&mut view, 10, 10);
         click(&mut view, 100, 10);
         click(&mut view, 100, 100);
-        assert!(view.key_down() && !view.polygon_active());
+        assert!(view.key_down(false) && !view.polygon_active());
         assert!(view.canvas().get(100, 50) && !view.canvas().get(56, 55));
     }
 

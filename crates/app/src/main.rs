@@ -3,6 +3,10 @@
 //! scaled up by a whole number on HiDPI screens to keep the pixels crisp.
 
 mod art;
+mod clipboard;
+mod commands;
+#[cfg(target_os = "macos")]
+mod menus;
 mod page_view;
 mod palettes;
 mod tool;
@@ -23,12 +27,14 @@ use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::{Key, ModifiersState};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, CustomCursor, Window, WindowId};
 
 use crate::art::CURSOR_SIZE;
-use crate::page_view::{Modifiers, PageView};
+use crate::clipboard::Clipboard;
+use crate::commands::Command;
+use crate::page_view::{Modifiers, PageView, SelectionCommand, ant_bit};
 use crate::palettes::{line_widths, patterns, tools};
 use crate::tool::Tool;
 
@@ -43,6 +49,17 @@ const WHITE: u32 = 0xffffff;
 const DOUBLE_CLICK_TIME: Duration = Duration::from_millis(500);
 /// Pixels a mouse wheel notch scrolls.
 const LINE_SCROLL: f64 = 16.0;
+/// MacPaint stepped its ants every tick (1/60 s); a little slower is
+/// kinder.
+const ANTS_INTERVAL: Duration = Duration::from_millis(40);
+
+/// Events from outside the window.
+#[derive(Debug)]
+enum UserEvent {
+    /// A menu item was chosen.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Menu(String),
+}
 
 /// Where everything goes in the window, in logical pixels. As in
 /// HaikuPaint: tools above the line palette on the left, patterns below
@@ -134,6 +151,11 @@ struct App {
     modifiers: ModifiersState,
     capture: Capture,
     last_click: Option<(Instant, ClickTarget)>,
+    next_ants: Instant,
+
+    clipboard: Clipboard,
+    #[cfg(target_os = "macos")]
+    menus: Option<menus::MenuBar>,
 }
 
 impl App {
@@ -155,6 +177,10 @@ impl App {
             modifiers: ModifiersState::empty(),
             capture: Capture::None,
             last_click: None,
+            next_ants: Instant::now(),
+            clipboard: Clipboard::new(),
+            #[cfg(target_os = "macos")]
+            menus: None,
         }
     }
 
@@ -264,8 +290,12 @@ impl App {
             // Double-clicking the eraser clears the page, as in MacPaint.
             if double && tool == Tool::Eraser {
                 self.view.clear();
-            } else {
-                self.set_tool(tool);
+                return;
+            }
+            self.set_tool(tool);
+            // Double-clicking the marquee selects the whole window.
+            if double && tool == Tool::Select {
+                self.view.select_all();
             }
             return;
         }
@@ -289,14 +319,67 @@ impl App {
     }
 
     fn key_down(&mut self, key: &Key) {
-        // Command-Z until the Edit menu arrives with milestone 5.
-        if self.modifiers().command
-            && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("z"))
-        {
-            self.view.undo();
+        if self.modifiers().command {
+            // On macOS the menus take their shortcuts before the window
+            // sees them; elsewhere they're handled here until milestone 5
+            // brings menus there too.
+            if !cfg!(target_os = "macos")
+                && let Key::Character(text) = key
+                && let Some(command) = text.chars().next().and_then(Command::from_shortcut)
+            {
+                self.run(command);
+            }
             return;
         }
-        self.view.key_down();
+        let delete = matches!(key, Key::Named(NamedKey::Backspace | NamedKey::Delete));
+        self.view.key_down(delete);
+    }
+
+    fn run(&mut self, command: Command) {
+        let selection_command = |command| match command {
+            Command::Invert => Some(SelectionCommand::Invert),
+            Command::Fill => Some(SelectionCommand::Fill),
+            Command::TraceEdges => Some(SelectionCommand::TraceEdges),
+            Command::FlipHorizontal => Some(SelectionCommand::FlipHorizontal),
+            Command::FlipVertical => Some(SelectionCommand::FlipVertical),
+            Command::Rotate => Some(SelectionCommand::Rotate),
+            _ => None,
+        };
+        match command {
+            Command::Undo => self.view.undo(),
+            Command::Cut | Command::Copy => {
+                if let Some(selection) = self.view.selection() {
+                    self.clipboard.copy(selection);
+                    if command == Command::Cut {
+                        self.view.clear_selection();
+                    }
+                }
+            }
+            Command::Paste => {
+                let page = self.view.canvas();
+                if let Some(pasted) = self.clipboard.paste(page.width(), page.height()) {
+                    self.view.paste(pasted);
+                }
+            }
+            Command::Clear => self.view.clear(),
+            Command::SelectAll => self.view.select_all(),
+            _ => {
+                if let Some(mut operation) = selection_command(command) {
+                    // As in MacPaint, Shift makes Trace Edges add a shadow.
+                    if operation == SelectionCommand::TraceEdges && self.modifiers().shift {
+                        operation = SelectionCommand::TraceEdgesShadow;
+                    }
+                    self.view.apply_to_selection(operation);
+                }
+            }
+        }
+        self.request_redraw();
+    }
+
+    fn request_redraw(&self) {
+        if let Some(graphics) = &self.graphics {
+            graphics.window.request_redraw();
+        }
     }
 
     fn mouse_up(&mut self) {
@@ -309,6 +392,9 @@ impl App {
 
     fn cursor_kind(&self) -> CursorKind {
         if self.capture != Capture::Page && !self.in_page_view(self.mouse) {
+            return CursorKind::Arrow;
+        }
+        if self.view.shows_arrow(self.page_point(self.mouse)) {
             return CursorKind::Arrow;
         }
         match self.view.tool() {
@@ -388,6 +474,24 @@ impl App {
                 } else {
                     WHITE
                 };
+            }
+        }
+
+        // The overlay goes on top, on screen only.
+        let (overlay, ants, phase) = self.view.overlay();
+        for point in overlay {
+            let (x, y) = (
+                point.x - origin.x + view.left,
+                point.y - origin.y + view.top,
+            );
+            if page.contains(point.x, point.y)
+                && x >= view.left.max(0)
+                && x < view.right.min(width)
+                && y >= view.top.max(0)
+                && y < view.bottom.min(height)
+            {
+                let black = !ants || ant_bit(point.x, point.y, phase);
+                frame[(y * width + x) as usize] = if black { BLACK } else { WHITE };
             }
         }
     }
@@ -519,10 +623,14 @@ impl App {
     }
 }
 
-impl ApplicationHandler for App {
+impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.graphics.is_some() {
             return;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.menus = Some(menus::MenuBar::install());
         }
         let page_height = Canvas::DEFAULT_HEIGHT;
         let attributes = Window::default_attributes()
@@ -617,14 +725,65 @@ impl ApplicationHandler for App {
             _ => changed = false,
         }
         self.update_cursor();
-        if changed && let Some(graphics) = &self.graphics {
-            graphics.window.request_redraw();
+        if changed {
+            self.request_redraw();
         }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            #[cfg(target_os = "macos")]
+            UserEvent::Menu(id) => {
+                let command = self
+                    .menus
+                    .as_ref()
+                    .and_then(|menus| menus.command(&id.into()));
+                if let Some(command) = command {
+                    self.run(command);
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            UserEvent::Menu(_) => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        if let Some(menus) = &self.menus {
+            menus.update(self.view.can_undo(), self.view.has_selection());
+        }
+
+        // March the ants while there are any.
+        if !self.view.has_ants() {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        let now = Instant::now();
+        if now >= self.next_ants {
+            self.view.march_ants();
+            self.request_redraw();
+            self.next_ants = now + ANTS_INTERVAL;
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_ants));
     }
 }
 
 fn main() {
-    let event_loop = EventLoop::new().expect("starting the event loop");
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    #[cfg(target_os = "macos")]
+    {
+        // RustPaint installs its own menus.
+        use winit::platform::macos::EventLoopBuilderExtMacOS;
+        builder.with_default_menu(false);
+    }
+    let event_loop = builder.build().expect("starting the event loop");
+    #[cfg(target_os = "macos")]
+    {
+        let proxy = event_loop.create_proxy();
+        muda::MenuEvent::set_event_handler(Some(move |event: muda::MenuEvent| {
+            let _ = proxy.send_event(UserEvent::Menu(event.id.0));
+        }));
+    }
     let mut app = App::new();
     event_loop
         .run_app(&mut app)
