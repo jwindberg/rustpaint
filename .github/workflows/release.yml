@@ -76,6 +76,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p rustpaint
+      - name: Check it needs no Visual C++ runtime
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          $dependents = & $dumpbin /nologo /dependents target/release/RustPaint.exe
+          $dependents
+          if ($dependents -match "VCRUNTIME|MSVCP|api-ms-win-crt|ucrtbase") {
+            Write-Error "RustPaint.exe needs the Visual C++ runtime"
+            exit 1
+          }
       - name: Zip
         shell: pwsh
         run: |

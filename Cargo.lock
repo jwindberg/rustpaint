@@ -2055,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "rustpaint"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arboard",
  "fluent-bundle",
@@ -2074,7 +2074,7 @@ dependencies = [
 
 [[package]]
 name = "rustpaint-engine"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "rustversion"
