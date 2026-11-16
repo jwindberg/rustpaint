@@ -1,10 +1,12 @@
 # Builds the packages for a version tag (v1.2.3) and attaches them to a
-# draft release, to be published by hand.
+# draft release, to be published by hand. Run it by hand (Actions → Release →
+# Run workflow) to build the packages without making a release.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,7 +15,7 @@ jobs:
   macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
@@ -39,40 +41,69 @@ jobs:
           done
           iconutil -c icns "$iconset" -o "$app/Resources/RustPaint.icns"
           ditto -c -k --keepParent RustPaint.app "RustPaint-$version-macOS.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos
           path: RustPaint-*-macOS.zip
 
   linux:
-    runs-on: ubuntu-22.04
+    name: linux (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-latest }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build
-        run: cargo build --release -p rustpaint
+      - uses: actions/checkout@v7
+      # A Linux program runs only where glibc is at least as new as the one it
+      # was built against, so build in manylinux2014 (CentOS 7, glibc 2.17):
+      # the AppImage then runs on any glibc-based distro from 2014 on.
+      - name: Build (manylinux2014, glibc 2.17)
+        run: |
+          docker run --rm -v "$PWD:/work" -w /work \
+            -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+            quay.io/pypa/manylinux2014_${{ matrix.arch }} \
+            bash -euo pipefail -c '
+              curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal
+              . "$HOME/.cargo/env"
+              cargo build --release -p rustpaint
+              cargo run --release -p rustpaint --example make_icons -- icons
+              chown -R "$HOST_UID:$HOST_GID" target icons
+            '
+      - name: Check it needs no glibc newer than 2.17
+        run: |
+          bin=target/release/RustPaint
+          objdump -p "$bin" | grep NEEDED
+          max=$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n 1)
+          echo "Needs glibc $max"
+          if [ "$(printf '%s\n' "$max" 2.17 | sort -V | tail -n 1)" != 2.17 ]; then
+            echo "RustPaint needs glibc $max, newer than 2.17" >&2
+            exit 1
+          fi
       - name: Make the AppImage
         run: |
           version="${GITHUB_REF_NAME#v}"
-          cargo run --release -p rustpaint --example make_icons -- icons
+          arch=${{ matrix.arch }}
           mkdir -p AppDir/usr/bin
           cp target/release/RustPaint AppDir/usr/bin/
           cp packaging/linux/rustpaint.desktop AppDir/
           cp icons/icon_256.png AppDir/rustpaint.png
           ln -s usr/bin/RustPaint AppDir/AppRun
           curl -sSfL -o appimagetool \
-            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-$arch.AppImage"
           chmod +x appimagetool
-          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=x86_64 ./appimagetool AppDir "RustPaint-$version-x86_64.AppImage"
-      - uses: actions/upload-artifact@v4
+          APPIMAGE_EXTRACT_AND_RUN=1 ARCH=$arch ./appimagetool AppDir "RustPaint-$version-$arch.AppImage"
+      - uses: actions/upload-artifact@v7
         with:
-          name: linux
+          name: linux-${{ matrix.arch }}
           path: RustPaint-*.AppImage
 
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release -p rustpaint
@@ -95,19 +126,20 @@ jobs:
           Copy-Item target/release/RustPaint.exe RustPaint/
           Copy-Item LICENSE, ATTRIBUTION.md, assets/fonts/OFL-Inter.txt RustPaint/
           Compress-Archive RustPaint "RustPaint-$version-windows-x64.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: RustPaint-*-windows-x64.zip
 
   release:
+    if: github.ref_type == 'tag'
     needs: [macos, linux, windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           draft: true
           files: RustPaint-*
