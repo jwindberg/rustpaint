@@ -82,10 +82,10 @@ fn glyph_canvas(code: i32) -> Canvas {
 pub fn mask_from_glyph(code: i32) -> Mask16 {
     let canvas = glyph_canvas(code);
     let mut mask = Mask16::default();
-    for y in 0..CURSOR_SIZE {
+    for (y, row) in mask.rows.iter_mut().enumerate().take(CURSOR_SIZE) {
         for x in 0..CURSOR_SIZE {
             if canvas.get(x as i32, y as i32) {
-                mask.rows[y] |= 0x8000 >> x;
+                *row |= 0x8000 >> x;
             }
         }
     }
